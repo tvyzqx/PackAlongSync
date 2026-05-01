@@ -1,0 +1,5 @@
+ALTER TABLE public.trips
+ADD COLUMN IF NOT EXISTS emoji TEXT;
+
+ALTER TABLE public.trips
+ADD COLUMN IF NOT EXISTS template_emoji TEXT;

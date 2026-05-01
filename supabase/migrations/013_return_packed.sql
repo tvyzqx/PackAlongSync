@@ -1,0 +1,5 @@
+ALTER TABLE public.items
+  ADD COLUMN IF NOT EXISTS return_packed BOOLEAN NOT NULL DEFAULT FALSE;
+
+ALTER TABLE public.items
+  ADD COLUMN IF NOT EXISTS return_packed_at TIMESTAMPTZ;
