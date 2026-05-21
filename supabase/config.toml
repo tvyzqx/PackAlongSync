@@ -1,9 +1,12 @@
-project_id = "packguide"
+project_id = "packalong"
 
 [api]
 enabled = true
 port = 54321
-schemas = ["public", "storage", "graphql_public"]
+# packalong is added so PostgREST exposes the schema. Self-hosted installs
+# additionally need PGRST_DB_SCHEMAS=public,storage,graphql_public,packalong
+# in supabase/docker/.env — config.toml only covers the local CLI stack.
+schemas = ["public", "storage", "graphql_public", "packalong"]
 extra_search_path = ["public", "extensions"]
 max_rows = 1000
 
@@ -14,3 +17,48 @@ major_version = 17
 
 [realtime]
 enabled = true
+
+[auth]
+# Public URL of the sync server. Override per environment via the
+# corresponding `.env` value if you self-host on a different domain.
+site_url = "https://sync.example.com"
+
+# Required so Supabase Auth accepts redirects back into the app.
+# - packalong://circle             — QR-onboarding payload deep link (ADR-13).
+# - https://packalong.app/claim/*  — magic-link claim universal link (ADR-13).
+# Without these entries Supabase rejects the redirect and the magic-link
+# flow fails with `redirect_to is not allowed`. The legacy trip-join scheme
+# packalong://join/<token> (ADR-8 v2) was removed: trip-join is deprecated
+# and the in-app legacy handler does not round-trip through auth.
+additional_redirect_urls = [
+  "packalong://circle",
+  "https://packalong.app/claim/*",
+  "https://www.packalong.app/claim/*",
+]
+
+[functions]
+verify_jwt = true
+
+# First-time signup — caller already has a JWT after signUpWithPassword.
+# auth.getUser(jwt) is used to derive caller.id (Plan 5.1).
+[functions.bootstrap-account]
+verify_jwt = true
+
+# Authenticated owner creates an additional circle (e.g. "Wandern Mike").
+[functions.create-circle]
+verify_jwt = true
+
+# Owner must be authenticated to issue an invite for a circle they own.
+[functions.generate-circle-invite]
+verify_jwt = true
+
+# Receiver may redeem a token either anonymously (QR scan before login)
+# or with an existing session (cross-circle join). Endpoint must accept
+# anonymous calls; Plan 5.4 branches on whether a JWT is present.
+[functions.join-circle]
+verify_jwt = false
+
+# Owner polls to see whether a token they issued has been claimed —
+# gated by JWT.
+[functions.check-join-status]
+verify_jwt = true

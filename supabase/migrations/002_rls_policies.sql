@@ -1,298 +1,218 @@
-ALTER TABLE public.users ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.persons ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.trips ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.pack_containers ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.items ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.participants ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.person_devices ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.person_claims ENABLE ROW LEVEL SECURITY;
+-- 002_rls_policies.sql
+--
+-- Phase 1 RLS scoping for the v3 circles n:m model (ADR-2). Three helper
+-- functions identify the caller's profile, their circle set, and ownership
+-- status once per query so policies don't inline the same subquery against
+-- profiles and circle_members.
+--
+-- The helpers must be SECURITY DEFINER. Otherwise any read of
+-- packalong.profiles or packalong.circle_members inside the helper would
+-- re-trigger their RLS, which calls the helper, which reads the same table …
+-- → infinite recursion. security definer makes the helpers run as the
+-- function owner (postgres), bypassing RLS for the lookup. search_path is
+-- locked down to keep them safe from search_path injection.
 
-CREATE OR REPLACE FUNCTION public.current_account_id()
-RETURNS TEXT
-LANGUAGE sql
-STABLE
-AS $$
-  SELECT auth.uid()::TEXT;
+-- helpers -------------------------------------------------------------------
+
+create or replace function packalong.auth_profile_id()
+returns uuid
+language sql
+security definer
+stable
+set search_path = packalong, pg_temp
+as $$
+  select id
+    from packalong.profiles
+   where user_id = auth.uid()
+     and deleted = false
+   limit 1;
 $$;
 
-CREATE OR REPLACE FUNCTION public.current_person_ids()
-RETURNS SETOF TEXT
-LANGUAGE sql
-STABLE
-AS $$
-  SELECT p.id
-  FROM public.persons p
-  WHERE p.deleted = false
-    AND (
-      p.account_id = public.current_account_id()
-      OR p.created_by_account_id = public.current_account_id()
-    );
+create or replace function packalong.auth_circle_ids()
+returns setof uuid
+language sql
+security definer
+stable
+set search_path = packalong, pg_temp
+as $$
+  select cm.circle_id
+    from packalong.circle_members cm
+    join packalong.profiles p on p.id = cm.profile_id
+   where p.user_id = auth.uid()
+     and cm.deleted = false
+     and p.deleted = false;
 $$;
 
-CREATE OR REPLACE FUNCTION public.can_access_trip(target_trip_id TEXT)
-RETURNS BOOLEAN
-LANGUAGE sql
-STABLE
-AS $$
-  SELECT EXISTS (
-    SELECT 1
-    FROM public.participants part
-    WHERE part.trip_id = target_trip_id
-      AND part.deleted = false
-      AND part.person_id IN (SELECT * FROM public.current_person_ids())
+create or replace function packalong.is_circle_owner(target_circle uuid)
+returns boolean
+language sql
+security definer
+stable
+set search_path = packalong, pg_temp
+as $$
+  select exists (
+    select 1
+      from packalong.circle_members cm
+      join packalong.profiles p on p.id = cm.profile_id
+     where cm.circle_id = target_circle
+       and p.user_id = auth.uid()
+       and cm.role = 'owner'
+       and cm.deleted = false
+       and p.deleted = false
   );
 $$;
 
-CREATE OR REPLACE FUNCTION public.can_edit_trip(target_trip_id TEXT)
-RETURNS BOOLEAN
-LANGUAGE sql
-STABLE
-AS $$
-  SELECT EXISTS (
-    SELECT 1
-    FROM public.participants part
-    WHERE part.trip_id = target_trip_id
-      AND part.deleted = false
-      AND part.role IN ('owner', 'editor')
-      AND part.person_id IN (SELECT * FROM public.current_person_ids())
+grant execute on function packalong.auth_profile_id()         to authenticated;
+grant execute on function packalong.auth_circle_ids()         to authenticated;
+grant execute on function packalong.is_circle_owner(uuid)     to authenticated;
+
+-- circles -------------------------------------------------------------------
+--
+-- SELECT  : any member of the circle sees its row.
+-- INSERT  : authenticated users may create a circle as long as created_by
+--           matches their auth uid. Membership (owner role) is added in a
+--           separate insert into circle_members by the calling edge
+--           function. bootstrap-account / create-circle typically run as
+--           service role and bypass RLS, but this policy keeps direct
+--           PostgREST inserts safe.
+-- UPDATE  : owner only.
+-- DELETE  : owner only.
+
+alter table packalong.circles enable row level security;
+
+create policy circles_select_member
+  on packalong.circles
+  for select
+  to authenticated
+  using (id in (select packalong.auth_circle_ids()));
+
+create policy circles_insert_self
+  on packalong.circles
+  for insert
+  to authenticated
+  with check (created_by = auth.uid());
+
+create policy circles_update_owner
+  on packalong.circles
+  for update
+  to authenticated
+  using (packalong.is_circle_owner(id))
+  with check (packalong.is_circle_owner(id));
+
+create policy circles_delete_owner
+  on packalong.circles
+  for delete
+  to authenticated
+  using (packalong.is_circle_owner(id));
+
+-- profiles ------------------------------------------------------------------
+--
+-- SELECT  : self (any role) OR any profile that shares at least one circle
+--           with the caller. Within a shared circle, everyone sees everyone
+--           (no can_see_* flags in PackAlong).
+-- INSERT  : own profile (user_id = auth.uid()) OR a local guest profile
+--           (user_id IS NULL). bootstrap-account and join-circle run as
+--           service role and bypass this policy.
+-- UPDATE  : self OR a circle-owner that shares a circle with the target
+--           profile.
+-- DELETE  : circle-owner that shares a circle with the target profile.
+--           Soft delete via deleted=true is the recommended path.
+
+alter table packalong.profiles enable row level security;
+
+create policy profiles_select_self_or_circle
+  on packalong.profiles
+  for select
+  to authenticated
+  using (
+    user_id = auth.uid()
+    or id in (
+      select cm.profile_id
+        from packalong.circle_members cm
+       where cm.circle_id in (select packalong.auth_circle_ids())
+         and cm.deleted = false
+    )
   );
-$$;
 
-CREATE OR REPLACE FUNCTION public.is_trip_owner(target_trip_id TEXT)
-RETURNS BOOLEAN
-LANGUAGE sql
-STABLE
-AS $$
-  SELECT EXISTS (
-    SELECT 1
-    FROM public.trips t
-    WHERE t.id = target_trip_id
-      AND t.deleted = false
-      AND t.owner_person_id IN (SELECT * FROM public.current_person_ids())
+create policy profiles_insert_self_or_guest
+  on packalong.profiles
+  for insert
+  to authenticated
+  with check (user_id = auth.uid() or user_id is null);
+
+create policy profiles_update_self_or_circle_owner
+  on packalong.profiles
+  for update
+  to authenticated
+  using (
+    user_id = auth.uid()
+    or exists (
+      select 1
+        from packalong.circle_members cm
+       where cm.profile_id = packalong.profiles.id
+         and cm.deleted = false
+         and packalong.is_circle_owner(cm.circle_id)
+    )
+  )
+  with check (
+    user_id = auth.uid()
+    or exists (
+      select 1
+        from packalong.circle_members cm
+       where cm.profile_id = packalong.profiles.id
+         and cm.deleted = false
+         and packalong.is_circle_owner(cm.circle_id)
+    )
   );
-$$;
 
-DROP POLICY IF EXISTS users_select_self ON public.users;
-CREATE POLICY users_select_self ON public.users
-FOR SELECT
-USING (id = public.current_account_id());
+create policy profiles_delete_circle_owner
+  on packalong.profiles
+  for delete
+  to authenticated
+  using (
+    exists (
+      select 1
+        from packalong.circle_members cm
+       where cm.profile_id = packalong.profiles.id
+         and cm.deleted = false
+         and packalong.is_circle_owner(cm.circle_id)
+    )
+  );
 
-DROP POLICY IF EXISTS users_insert_self ON public.users;
-CREATE POLICY users_insert_self ON public.users
-FOR INSERT
-WITH CHECK (id = public.current_account_id());
+-- circle_members ------------------------------------------------------------
+--
+-- SELECT  : any member of the circle sees its membership rows. Required so
+--           a member can render "who else is in this group".
+-- INSERT  : owner of the target circle. join-circle runs as service role.
+-- UPDATE  : owner of the target circle (role / soft-delete bookkeeping).
+-- DELETE  : owner of the target circle OR the user themselves (self-leave).
 
-DROP POLICY IF EXISTS users_update_self ON public.users;
-CREATE POLICY users_update_self ON public.users
-FOR UPDATE
-USING (id = public.current_account_id())
-WITH CHECK (id = public.current_account_id());
+alter table packalong.circle_members enable row level security;
 
-DROP POLICY IF EXISTS persons_select_accessible ON public.persons;
-CREATE POLICY persons_select_accessible ON public.persons
-FOR SELECT
-USING (
-  account_id = public.current_account_id()
-  OR created_by_account_id = public.current_account_id()
-  OR EXISTS (
-    SELECT 1
-    FROM public.participants part
-    WHERE part.person_id = persons.id
-      AND part.deleted = false
-      AND public.can_access_trip(part.trip_id)
-  )
-);
+create policy circle_members_select_member
+  on packalong.circle_members
+  for select
+  to authenticated
+  using (circle_id in (select packalong.auth_circle_ids()));
 
-DROP POLICY IF EXISTS persons_insert_owner ON public.persons;
-CREATE POLICY persons_insert_owner ON public.persons
-FOR INSERT
-WITH CHECK (
-  created_by_account_id = public.current_account_id()
-  OR account_id = public.current_account_id()
-);
+create policy circle_members_insert_owner
+  on packalong.circle_members
+  for insert
+  to authenticated
+  with check (packalong.is_circle_owner(circle_id));
 
-DROP POLICY IF EXISTS persons_update_owner ON public.persons;
-CREATE POLICY persons_update_owner ON public.persons
-FOR UPDATE
-USING (
-  account_id = public.current_account_id()
-  OR created_by_account_id = public.current_account_id()
-)
-WITH CHECK (
-  account_id = public.current_account_id()
-  OR created_by_account_id = public.current_account_id()
-);
+create policy circle_members_update_owner
+  on packalong.circle_members
+  for update
+  to authenticated
+  using (packalong.is_circle_owner(circle_id))
+  with check (packalong.is_circle_owner(circle_id));
 
-DROP POLICY IF EXISTS persons_delete_owner ON public.persons;
-CREATE POLICY persons_delete_owner ON public.persons
-FOR DELETE
-USING (
-  account_id = public.current_account_id()
-  OR created_by_account_id = public.current_account_id()
-);
-
-DROP POLICY IF EXISTS trips_select_accessible ON public.trips;
-CREATE POLICY trips_select_accessible ON public.trips
-FOR SELECT
-USING (public.can_access_trip(id));
-
-DROP POLICY IF EXISTS trips_insert_owner ON public.trips;
-CREATE POLICY trips_insert_owner ON public.trips
-FOR INSERT
-WITH CHECK (owner_person_id IN (SELECT * FROM public.current_person_ids()));
-
-DROP POLICY IF EXISTS trips_update_owner ON public.trips;
-CREATE POLICY trips_update_owner ON public.trips
-FOR UPDATE
-USING (public.is_trip_owner(id))
-WITH CHECK (public.is_trip_owner(id));
-
-DROP POLICY IF EXISTS trips_delete_owner ON public.trips;
-CREATE POLICY trips_delete_owner ON public.trips
-FOR DELETE
-USING (public.is_trip_owner(id));
-
-DROP POLICY IF EXISTS participants_select_accessible ON public.participants;
-CREATE POLICY participants_select_accessible ON public.participants
-FOR SELECT
-USING (public.can_access_trip(trip_id));
-
-DROP POLICY IF EXISTS participants_insert_editors ON public.participants;
-CREATE POLICY participants_insert_editors ON public.participants
-FOR INSERT
-WITH CHECK (public.can_edit_trip(trip_id));
-
-DROP POLICY IF EXISTS participants_update_editors ON public.participants;
-CREATE POLICY participants_update_editors ON public.participants
-FOR UPDATE
-USING (public.can_edit_trip(trip_id))
-WITH CHECK (public.can_edit_trip(trip_id));
-
-DROP POLICY IF EXISTS participants_delete_owner ON public.participants;
-CREATE POLICY participants_delete_owner ON public.participants
-FOR DELETE
-USING (public.is_trip_owner(trip_id));
-
-DROP POLICY IF EXISTS items_select_accessible ON public.items;
-CREATE POLICY items_select_accessible ON public.items
-FOR SELECT
-USING (public.can_access_trip(trip_id));
-
-DROP POLICY IF EXISTS items_insert_editors ON public.items;
-CREATE POLICY items_insert_editors ON public.items
-FOR INSERT
-WITH CHECK (public.can_edit_trip(trip_id));
-
-DROP POLICY IF EXISTS items_update_editors ON public.items;
-CREATE POLICY items_update_editors ON public.items
-FOR UPDATE
-USING (public.can_edit_trip(trip_id))
-WITH CHECK (public.can_edit_trip(trip_id));
-
-DROP POLICY IF EXISTS items_delete_editors ON public.items;
-CREATE POLICY items_delete_editors ON public.items
-FOR DELETE
-USING (public.can_edit_trip(trip_id));
-
-DROP POLICY IF EXISTS containers_select_accessible ON public.pack_containers;
-CREATE POLICY containers_select_accessible ON public.pack_containers
-FOR SELECT
-USING (public.can_access_trip(trip_id));
-
-DROP POLICY IF EXISTS containers_insert_editors ON public.pack_containers;
-CREATE POLICY containers_insert_editors ON public.pack_containers
-FOR INSERT
-WITH CHECK (public.can_edit_trip(trip_id));
-
-DROP POLICY IF EXISTS containers_update_editors ON public.pack_containers;
-CREATE POLICY containers_update_editors ON public.pack_containers
-FOR UPDATE
-USING (public.can_edit_trip(trip_id))
-WITH CHECK (public.can_edit_trip(trip_id));
-
-DROP POLICY IF EXISTS containers_delete_editors ON public.pack_containers;
-CREATE POLICY containers_delete_editors ON public.pack_containers
-FOR DELETE
-USING (public.can_edit_trip(trip_id));
-
-DROP POLICY IF EXISTS person_devices_select_owner ON public.person_devices;
-CREATE POLICY person_devices_select_owner ON public.person_devices
-FOR SELECT
-USING (
-  EXISTS (
-    SELECT 1
-    FROM public.persons p
-    WHERE p.id = person_devices.person_id
-      AND (
-        p.account_id = public.current_account_id()
-        OR p.created_by_account_id = public.current_account_id()
-      )
-  )
-);
-
-DROP POLICY IF EXISTS person_devices_write_owner ON public.person_devices;
-CREATE POLICY person_devices_write_owner ON public.person_devices
-FOR ALL
-USING (
-  EXISTS (
-    SELECT 1
-    FROM public.persons p
-    WHERE p.id = person_devices.person_id
-      AND (
-        p.account_id = public.current_account_id()
-        OR p.created_by_account_id = public.current_account_id()
-      )
-  )
-)
-WITH CHECK (
-  EXISTS (
-    SELECT 1
-    FROM public.persons p
-    WHERE p.id = person_devices.person_id
-      AND (
-        p.account_id = public.current_account_id()
-        OR p.created_by_account_id = public.current_account_id()
-      )
-  )
-);
-
-DROP POLICY IF EXISTS person_claims_select_owner ON public.person_claims;
-CREATE POLICY person_claims_select_owner ON public.person_claims
-FOR SELECT
-USING (
-  EXISTS (
-    SELECT 1
-    FROM public.persons p
-    WHERE p.id = person_claims.person_id
-      AND (
-        p.account_id = public.current_account_id()
-        OR p.created_by_account_id = public.current_account_id()
-      )
-  )
-);
-
-DROP POLICY IF EXISTS person_claims_write_owner ON public.person_claims;
-CREATE POLICY person_claims_write_owner ON public.person_claims
-FOR ALL
-USING (
-  EXISTS (
-    SELECT 1
-    FROM public.persons p
-    WHERE p.id = person_claims.person_id
-      AND (
-        p.account_id = public.current_account_id()
-        OR p.created_by_account_id = public.current_account_id()
-      )
-  )
-)
-WITH CHECK (
-  EXISTS (
-    SELECT 1
-    FROM public.persons p
-    WHERE p.id = person_claims.person_id
-      AND (
-        p.account_id = public.current_account_id()
-        OR p.created_by_account_id = public.current_account_id()
-      )
-  )
-);
+create policy circle_members_delete_owner_or_self
+  on packalong.circle_members
+  for delete
+  to authenticated
+  using (
+    packalong.is_circle_owner(circle_id)
+    or profile_id = packalong.auth_profile_id()
+  );

@@ -1,153 +1,120 @@
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
+-- 001_initial_schema.sql
+--
+-- Phase 1 of the PackAlong sync rollout (v3 — Circles n:m, 2026-05-21).
+-- Creates the three core tables circles, profiles, and circle_members in
+-- the dedicated `packalong` schema (ADR-1).
+--
+-- Prerequisites (P1.0, applied manually by the server admin once):
+--   create schema if not exists packalong;
+--   grant usage on schema packalong to anon, authenticated, service_role;
+--   alter default privileges in schema packalong
+--     grant all on tables, sequences, functions to anon, authenticated, service_role;
+--   PGRST_DB_SCHEMAS must include 'packalong'.
+--
+-- This migration assumes the schema exists. RLS policies live in
+-- 002_rls_policies.sql.
 
-CREATE OR REPLACE FUNCTION public.update_updated_at()
-RETURNS TRIGGER AS $$
-BEGIN
-  NEW.updated_at = now();
-  RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
+-- updated_at maintenance ----------------------------------------------------
+--
+-- LWW conflict resolution downstream (profile sync, entity sync) relies on
+-- updated_at being monotonic on UPDATE. We don't trust clients to set it, so
+-- a trigger does it server-side. Defined once, reused across tables.
 
-CREATE TABLE IF NOT EXISTS public.users (
-  id TEXT PRIMARY KEY,
-  email TEXT UNIQUE NOT NULL,
-  premium_status TEXT NOT NULL DEFAULT 'free',
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+create or replace function packalong.set_updated_at()
+returns trigger
+language plpgsql
+as $$
+begin
+  new.updated_at = now();
+  return new;
+end;
+$$;
+
+-- circles -------------------------------------------------------------------
+--
+-- Top-level sync and visibility boundary (ADR-2). UI label: "Gruppe".
+-- A profile is a member of N circles via circle_members (n:m). Patchwork
+-- (one person in multiple families) is a day-one feature.
+
+create table packalong.circles (
+  id          uuid primary key default gen_random_uuid(),
+  name        text not null,
+  icon_emoji  text,
+  color       text,
+  created_by  uuid not null references auth.users(id) on delete restrict,
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now()
 );
 
-CREATE TABLE IF NOT EXISTS public.persons (
-  id TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  profile_type TEXT NOT NULL DEFAULT 'guest',
-  account_id TEXT,
-  created_by_account_id TEXT,
-  avatar_emoji TEXT,
-  origin_instance TEXT,
-  user_id TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  synced_at TIMESTAMPTZ,
-  dirty BOOLEAN NOT NULL DEFAULT false,
-  dirty_fields TEXT,
-  deleted BOOLEAN NOT NULL DEFAULT false
+create index circles_created_by_idx on packalong.circles (created_by);
+
+create trigger circles_set_updated_at
+  before update on packalong.circles
+  for each row execute function packalong.set_updated_at();
+
+-- profiles ------------------------------------------------------------------
+--
+-- A person's identity. UI label: "Person". ADR-5: one auth user maps to
+-- at most one profile (partial unique index ignores guest profiles where
+-- user_id is null). Guest profiles can be claimed later by setting user_id
+-- and flipping profile_type to 'account'.
+--
+-- No circle_id here (v2 -> v3 pivot). Circle membership lives in
+-- circle_members so a profile can belong to N circles simultaneously.
+
+create table packalong.profiles (
+  id               uuid primary key default gen_random_uuid(),
+  user_id          uuid references auth.users(id) on delete set null,
+  profile_type     text not null default 'guest'
+                       check (profile_type in ('guest', 'account')),
+  name             text not null,
+  avatar_emoji     text,
+  avatar_color     text,
+  origin_instance  text,
+  created_at       timestamptz not null default now(),
+  updated_at       timestamptz not null default now(),
+  synced_at        timestamptz,
+  dirty            boolean not null default false,
+  dirty_fields     text,
+  deleted          boolean not null default false
 );
 
-CREATE TABLE IF NOT EXISTS public.trips (
-  id TEXT PRIMARY KEY,
-  title TEXT NOT NULL,
-  owner_person_id TEXT NOT NULL REFERENCES public.persons(id) ON DELETE CASCADE,
-  join_token TEXT UNIQUE,
-  start_date TIMESTAMPTZ,
-  end_date TIMESTAMPTZ,
-  is_archived BOOLEAN NOT NULL DEFAULT false,
-  origin_instance TEXT,
-  user_id TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  synced_at TIMESTAMPTZ,
-  dirty BOOLEAN NOT NULL DEFAULT false,
-  dirty_fields TEXT,
-  deleted BOOLEAN NOT NULL DEFAULT false
+-- ADR-5: one supabase user -> at most one profile. Partial index ignores
+-- guest rows (user_id null) waiting for a claim.
+create unique index profiles_user_id_unique
+  on packalong.profiles (user_id)
+  where user_id is not null;
+
+create trigger profiles_set_updated_at
+  before update on packalong.profiles
+  for each row execute function packalong.set_updated_at();
+
+-- circle_members ------------------------------------------------------------
+--
+-- n:m membership between profiles and circles (ADR-2). Role is per
+-- membership, so the same person can be owner in their family circle and
+-- member in a friend-trip circle.
+
+create table packalong.circle_members (
+  circle_id        uuid not null references packalong.circles(id) on delete cascade,
+  profile_id       uuid not null references packalong.profiles(id) on delete cascade,
+  role             text not null default 'member'
+                       check (role in ('owner', 'member', 'viewer')),
+  joined_at        timestamptz not null default now(),
+  updated_at       timestamptz not null default now(),
+  synced_at        timestamptz,
+  dirty            boolean not null default false,
+  dirty_fields     text,
+  deleted          boolean not null default false,
+  origin_instance  text,
+  primary key (circle_id, profile_id)
 );
 
-CREATE TABLE IF NOT EXISTS public.pack_containers (
-  id TEXT PRIMARY KEY,
-  trip_id TEXT NOT NULL REFERENCES public.trips(id) ON DELETE CASCADE,
-  name TEXT NOT NULL,
-  icon TEXT,
-  created_by_person_id TEXT REFERENCES public.persons(id) ON DELETE SET NULL,
-  origin_instance TEXT,
-  user_id TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  synced_at TIMESTAMPTZ,
-  dirty BOOLEAN NOT NULL DEFAULT false,
-  dirty_fields TEXT,
-  deleted BOOLEAN NOT NULL DEFAULT false
-);
+create index circle_members_profile_idx
+  on packalong.circle_members (profile_id) where deleted = false;
+create index circle_members_circle_idx
+  on packalong.circle_members (circle_id) where deleted = false;
 
-CREATE TABLE IF NOT EXISTS public.items (
-  id TEXT PRIMARY KEY,
-  trip_id TEXT NOT NULL REFERENCES public.trips(id) ON DELETE CASCADE,
-  title TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'open',
-  assigned_to_person_id TEXT REFERENCES public.persons(id) ON DELETE SET NULL,
-  container_id TEXT REFERENCES public.pack_containers(id) ON DELETE SET NULL,
-  category TEXT,
-  note TEXT,
-  updated_by_person_id TEXT REFERENCES public.persons(id) ON DELETE SET NULL,
-  origin_instance TEXT,
-  user_id TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  synced_at TIMESTAMPTZ,
-  dirty BOOLEAN NOT NULL DEFAULT false,
-  dirty_fields TEXT,
-  deleted BOOLEAN NOT NULL DEFAULT false
-);
-
-CREATE TABLE IF NOT EXISTS public.participants (
-  id TEXT PRIMARY KEY,
-  trip_id TEXT NOT NULL REFERENCES public.trips(id) ON DELETE CASCADE,
-  person_id TEXT NOT NULL REFERENCES public.persons(id) ON DELETE CASCADE,
-  role TEXT NOT NULL DEFAULT 'guest',
-  join_type TEXT NOT NULL DEFAULT 'local',
-  joined_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  origin_instance TEXT,
-  user_id TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  synced_at TIMESTAMPTZ,
-  dirty BOOLEAN NOT NULL DEFAULT false,
-  dirty_fields TEXT,
-  deleted BOOLEAN NOT NULL DEFAULT false,
-  UNIQUE(trip_id, person_id)
-);
-
-CREATE TABLE IF NOT EXISTS public.person_devices (
-  id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
-  person_id TEXT NOT NULL REFERENCES public.persons(id) ON DELETE CASCADE,
-  device_id TEXT NOT NULL,
-  access_token TEXT NOT NULL UNIQUE,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE(person_id, device_id)
-);
-
-CREATE TABLE IF NOT EXISTS public.person_claims (
-  id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
-  person_id TEXT NOT NULL REFERENCES public.persons(id) ON DELETE CASCADE,
-  claim_token TEXT NOT NULL UNIQUE,
-  expires_at TIMESTAMPTZ NOT NULL,
-  used BOOLEAN NOT NULL DEFAULT false,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-DROP TRIGGER IF EXISTS trg_persons_updated_at ON public.persons;
-CREATE TRIGGER trg_persons_updated_at
-BEFORE UPDATE ON public.persons
-FOR EACH ROW
-EXECUTE FUNCTION public.update_updated_at();
-
-DROP TRIGGER IF EXISTS trg_trips_updated_at ON public.trips;
-CREATE TRIGGER trg_trips_updated_at
-BEFORE UPDATE ON public.trips
-FOR EACH ROW
-EXECUTE FUNCTION public.update_updated_at();
-
-DROP TRIGGER IF EXISTS trg_pack_containers_updated_at ON public.pack_containers;
-CREATE TRIGGER trg_pack_containers_updated_at
-BEFORE UPDATE ON public.pack_containers
-FOR EACH ROW
-EXECUTE FUNCTION public.update_updated_at();
-
-DROP TRIGGER IF EXISTS trg_items_updated_at ON public.items;
-CREATE TRIGGER trg_items_updated_at
-BEFORE UPDATE ON public.items
-FOR EACH ROW
-EXECUTE FUNCTION public.update_updated_at();
-
-DROP TRIGGER IF EXISTS trg_participants_updated_at ON public.participants;
-CREATE TRIGGER trg_participants_updated_at
-BEFORE UPDATE ON public.participants
-FOR EACH ROW
-EXECUTE FUNCTION public.update_updated_at();
+create trigger circle_members_set_updated_at
+  before update on packalong.circle_members
+  for each row execute function packalong.set_updated_at();
