@@ -7,8 +7,14 @@
 -- Prerequisites (P1.0, applied manually by the server admin once):
 --   create schema if not exists packalong;
 --   grant usage on schema packalong to anon, authenticated, service_role;
+--   -- alter default privileges accepts only ONE object-type per call,
+--   -- so the grant has to be split across three statements:
 --   alter default privileges in schema packalong
---     grant all on tables, sequences, functions to anon, authenticated, service_role;
+--     grant all on tables    to anon, authenticated, service_role;
+--   alter default privileges in schema packalong
+--     grant all on sequences to anon, authenticated, service_role;
+--   alter default privileges in schema packalong
+--     grant all on functions to anon, authenticated, service_role;
 --   PGRST_DB_SCHEMAS must include 'packalong'.
 --
 -- This migration assumes the schema exists. RLS policies live in
