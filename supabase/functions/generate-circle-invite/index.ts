@@ -147,18 +147,33 @@ Deno.serve(async (req) => {
 
     return json({
       token,
+      // snake_case is the contract the Flutter client reads (matching
+      // pa-bootstrap-account); camelCase keys are kept as aliases for any
+      // older client build still in the field.
+      expires_at: expiresAt.toISOString(),
       expiresAt: expiresAt.toISOString(),
+      ttl_seconds: ttlMinutes * 60,
       ttlSeconds: ttlMinutes * 60,
       server: publicUrl,
+      anon_key: anonKey,
       anonKey,
+      circle_id: circleId,
       circleId,
+      profile_id: profileId || null,
       profileId: profileId || null,
+      invited_role: invitedRole,
       invitedRole,
+      issued_by_profile_id: callerProfileId,
       issuedByProfileId: callerProfileId,
+      delivery_channel: isEmailChannel ? "email" : "qr",
       deliveryChannel: isEmailChannel ? "email" : "qr",
+      email_target: isEmailChannel ? recipientEmail : null,
       emailTarget: isEmailChannel ? recipientEmail : null,
+      email_sent: emailSent,
       emailSent,
+      email_fallback_link: emailFallbackLink,
       emailFallbackLink,
+      universal_link: universalLink,
       universalLink,
     });
   } catch (error) {
