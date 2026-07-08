@@ -22,6 +22,22 @@
 --
 -- Idempotent: every statement guards on deleted = false, so re-running only
 -- touches rows that are still live.
+--
+-- The circles table was created in 001 WITHOUT the sync columns every other
+-- synced table carries (it predates the soft-delete sync model and was
+-- previously undeletable). Two of those columns are needed now:
+--   * deleted        — the cascade below writes circles.deleted, and the
+--                      client circle-pull honours it to purge tombstones.
+--   * origin_instance — every other synced table has it (nullable text); the
+--                      client already pushes it in the circles upsert payload,
+--                      so its absence silently failed that push.
+-- Both guarded with IF NOT EXISTS so this migration stays idempotent.
+
+alter table packalong.circles
+  add column if not exists deleted boolean not null default false;
+
+alter table packalong.circles
+  add column if not exists origin_instance text;
 
 create or replace function packalong.soft_delete_circle(target_circle uuid)
 returns void
