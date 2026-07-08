@@ -153,4 +153,13 @@ begin
 end;
 $$;
 
+-- Postgres grants EXECUTE to PUBLIC on every new function. Since this is a
+-- SECURITY DEFINER cascade with NO internal auth check (the owner check lives
+-- in the pa-delete-circle edge function), that default would let any anon /
+-- authenticated client call it directly via PostgREST rpc and delete an
+-- arbitrary circle by UUID. Revoke the default and grant only service_role so
+-- the edge function is the sole gateway.
+revoke all on function packalong.soft_delete_circle(uuid) from public;
+revoke all on function packalong.soft_delete_circle(uuid) from anon;
+revoke all on function packalong.soft_delete_circle(uuid) from authenticated;
 grant execute on function packalong.soft_delete_circle(uuid) to service_role;
