@@ -122,12 +122,39 @@ Deno.serve(async (req) => {
     const authHeader = req.headers.get("Authorization") ?? "";
     const jwt = authHeader.replace(/^Bearer\s+/i, "").trim();
     let preAuthUserId: string | null = null;
+    let preAuthUserEmail: string | null = null;
     if (jwt) {
       const { data: pre, error: preError } = await admin.auth.getUser(jwt);
-      if (!preError && pre.user) preAuthUserId = pre.user.id;
+      if (!preError && pre.user) {
+        preAuthUserId = pre.user.id;
+        preAuthUserEmail = pre.user.email ?? null;
+      }
     }
 
+    // Email binding: when the invite carries an email_target, redemption is
+    // restricted to that address. provisionAuthUser already enforces this on
+    // the anonymous path (it mints the auth user *as* email_target). The JWT
+    // path (an already-logged-in user) previously trusted the session
+    // blindly — so anyone with the public share link could join as
+    // themselves. Enforce the same binding here: the caller's own address
+    // must match, case-insensitively, or it's a 403.
+    const isEmailBound = typeof invite.email_target === "string" &&
+      invite.email_target.trim().length > 0;
+
     if (preAuthUserId) {
+      if (
+        isEmailBound &&
+        (preAuthUserEmail ?? "").toLowerCase() !==
+          invite.email_target!.trim().toLowerCase()
+      ) {
+        return json(
+          {
+            error: "This invite is bound to a different email address.",
+            code: "email_mismatch",
+          },
+          403,
+        );
+      }
       callerId = preAuthUserId;
     } else {
       const provision = await provisionAuthUser({
