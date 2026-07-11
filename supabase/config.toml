@@ -25,15 +25,15 @@ site_url = "https://sync.example.com"
 
 # Required so Supabase Auth accepts redirects back into the app.
 # - packalong://circle             — QR-onboarding payload deep link (ADR-13).
-# - https://packalong.app/claim/*  — magic-link claim universal link (ADR-13).
+# - https://packalong.org/claim/*  — magic-link claim universal link (ADR-13).
 # Without these entries Supabase rejects the redirect and the magic-link
 # flow fails with `redirect_to is not allowed`. The legacy trip-join scheme
 # packalong://join/<token> (ADR-8 v2) was removed: trip-join is deprecated
 # and the in-app legacy handler does not round-trip through auth.
 additional_redirect_urls = [
   "packalong://circle",
-  "https://packalong.app/claim/*",
-  "https://www.packalong.app/claim/*",
+  "https://packalong.org/claim/*",
+  "https://www.packalong.org/claim/*",
 ]
 
 [functions]
