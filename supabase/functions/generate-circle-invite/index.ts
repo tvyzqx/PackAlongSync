@@ -12,7 +12,7 @@
 //   'email' : when recipient_email is set we additionally invoke
 //             auth.admin.inviteUserByEmail (with admin.generateLink as
 //             fallback if the address is already registered). TTL ~7 d.
-//             Receiver lands at https://packalong.app/claim/<token>.
+//             Receiver lands at https://packalong.org/claim/<token>.
 //
 // Role gating: invited_role defaults to 'member'. The DB CHECK constraint
 // enforces {owner|member|viewer}; we validate up-front for a friendlier
@@ -346,7 +346,7 @@ function parseTtl(isEmailChannel: boolean): number {
 }
 
 function buildClaimUniversalLink(token: string): string {
-  const host = Deno.env.get("PUBLIC_APP_HOST") ?? "packalong.app";
+  const host = Deno.env.get("PUBLIC_APP_HOST") ?? "packalong.org";
   return `https://${host}/claim/${token}`;
 }
 

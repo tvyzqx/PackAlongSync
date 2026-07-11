@@ -11,7 +11,7 @@
 //               auth.admin.inviteUserByEmail (falls back to
 //               admin.generateLink + manual mail if the address is already
 //               registered). TTL ~7 d. The receiver lands at
-//               https://packalong.app/claim/<token>.
+//               https://packalong.org/claim/<token>.
 //
 // Token hygiene (ADR-4): when a new token is issued for a profile we
 // retire any still-open token for that profile so two devices can't race
@@ -217,7 +217,7 @@ function parseTtl(isEmailChannel: boolean): number {
 }
 
 function buildClaimUniversalLink(token: string): string {
-  const host = Deno.env.get("PUBLIC_APP_HOST") ?? "packalong.app";
+  const host = Deno.env.get("PUBLIC_APP_HOST") ?? "packalong.org";
   return `https://${host}/claim/${token}`;
 }
 

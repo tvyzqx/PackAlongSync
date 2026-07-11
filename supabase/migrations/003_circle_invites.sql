@@ -5,7 +5,7 @@
 --   'qr'    — in-person scan, TTL ~10 minutes, payload base64-encoded as
 --             part of packalong://circle?payload=...
 --   'email' — magic-link via auth.admin.inviteUserByEmail, TTL ~7 days,
---             redirect lands at https://packalong.app/claim/<token>.
+--             redirect lands at https://packalong.org/claim/<token>.
 -- TTL itself is enforced inside generate-circle-invite; the column
 -- documents which channel a token belongs to (audit + reissue logic).
 --
