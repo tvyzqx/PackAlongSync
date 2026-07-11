@@ -1,0 +1,20 @@
+{
+  "applinks": {
+    "apps": [],
+    "details": [
+      {
+        "appID": "REPLACE_TEAMID.REPLACE_BUNDLE_ID",
+        "paths": [
+          "/claim/*",
+          "/trip/*",
+          "/share/*"
+        ],
+        "components": [
+          { "/": "/claim/*" },
+          { "/": "/trip/*" },
+          { "/": "/share/*" }
+        ]
+      }
+    ]
+  }
+}

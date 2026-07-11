@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>PackAlong öffnen</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+         font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+         background:#0f1115; color:#e8eaed; }
+  @media (prefers-color-scheme: light){ body{ background:#f6f7f9; color:#1b1d22; } }
+  .card { max-width:420px; padding:2rem 1.5rem; text-align:center; }
+  h1 { font-size:1.4rem; margin:0 0 .5rem; }
+  p  { opacity:.8; line-height:1.5; margin:.25rem 0 1.5rem; }
+  .btn { display:block; padding:.85rem 1rem; margin:.5rem 0; border-radius:12px;
+         text-decoration:none; font-weight:600; background:#3b82f6; color:#fff; }
+  .btn.secondary { background:transparent; border:1px solid currentColor; color:inherit; opacity:.85; }
+  .brand { margin-top:1.5rem; font-size:.8rem; opacity:.5; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>PackAlong öffnen</h1>
+    <p id="msg">Wenn die App installiert ist, öffnet sie sich automatisch. Sonst hol dir PackAlong:</p>
+    <!-- REPLACE store URLs before go-live -->
+    <a class="btn" id="ios"     href="REPLACE_APP_STORE_URL">Im App&nbsp;Store laden</a>
+    <a class="btn" id="android" href="REPLACE_PLAY_STORE_URL">Bei Google&nbsp;Play laden</a>
+    <a class="btn secondary" id="retry" href="#">App erneut öffnen</a>
+    <p class="brand">PackAlong</p>
+  </div>
+<script>
+  // The invite/share token is the last path segment, e.g. /claim/<token>.
+  // Universal/App Links open the app directly; this page is the fallback
+  // shown only when the app is not installed. As a last resort we also try
+  // the custom scheme so a freshly installed app can still catch the token.
+  (function () {
+    var parts = location.pathname.replace(/\/+$/, "").split("/");
+    var kind  = parts[parts.length - 2] || "claim";   // claim | trip | share
+    var token = parts[parts.length - 1] || "";
+    var scheme = "packalong://" + kind + "?token=" + encodeURIComponent(token);
+    function tryApp(){ if (token) window.location.href = scheme; }
+    document.getElementById("retry").addEventListener("click", function (e) { e.preventDefault(); tryApp(); });
+    // Best-effort auto-attempt on load (harmless if scheme is unhandled).
+    tryApp();
+  })();
+</script>
+</body>
+</html>
