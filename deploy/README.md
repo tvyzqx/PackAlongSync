@@ -72,7 +72,7 @@ curl -sI https://packalong.org/.well-known/apple-app-site-association | grep -i 
 curl -s  https://packalong.org/.well-known/assetlinks.json | head
 curl -sI https://packalong.org/claim/TESTTOKEN | head -n1                                       # 200, serves deeplink.html
 curl -s  https://sync.packalong.org/auth/v1/health -H "apikey: <ANON_KEY>"                       # {"...":true}
-curl -s  https://packalong.org/ -I | head -n1                                                    # 200 (proxy) — explainer
+curl -sI https://packalong.org/ | head -n1                                                       # 301 -> t-velope.cc/en/packalong
 ```
 
 ## App side (other repo, PackAlong app)
@@ -87,6 +87,8 @@ The `appID` / package / signing SHA-256 used above must match this build.
 - Point guest share links at the public facade instead of the private host:
   set `SUPABASE_PUBLIC_URL=https://sync.packalong.org` in `/opt/supabase/.env`
   and recreate `functions`. Then `api.7-tm.de` stays fully private.
-- Root landing: template ships with **Option A** (masked proxy, keeps
-  `packalong.org` in the URL). To switch to a plain 301 redirect
-  (`t-velope.cc/en/packalong`), see the comment block in `packalong.stpl`.
+- Root landing: template ships with a **301 redirect** to
+  `t-velope.cc/en/packalong` (chosen). Long-term plan is a dedicated
+  packalong.org landing built in the Astro repo; swap the `location /`
+  block in `packalong.stpl` for that origin when it exists. A masked-proxy
+  alternative (keeps the URL) is documented as a comment in the same file.
