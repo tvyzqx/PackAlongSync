@@ -320,7 +320,7 @@ function defaultInviteExpiry(): Date {
 }
 
 function buildClaimUniversalLink(token: string): string {
-  const host = Deno.env.get("PUBLIC_APP_HOST") ?? "packalong.app";
+  const host = Deno.env.get("PUBLIC_APP_HOST") ?? "packalong.org";
   return `https://${host}/claim/${token}`;
 }
 

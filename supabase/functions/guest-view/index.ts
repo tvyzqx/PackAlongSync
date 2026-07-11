@@ -242,7 +242,7 @@ function renderPage({
   <footer>
     <p class="report">
       Missbrauch oder unangemessene Inhalte?
-      <a href="mailto:report@packalong.app?subject=Report%20guest%20view">Melden</a>.
+      <a href="mailto:report@packalong.org?subject=Report%20guest%20view">Melden</a>.
       Nutzung unterliegt der EULA; gemeldete Inhalte werden geprüft.
     </p>
     <p class="brand">PackAlong</p>
@@ -328,7 +328,7 @@ function renderItem(item: ItemRow): string {
 }
 
 function renderJoinBlock(email: string | null, joinToken: string | null): string {
-  const appHost = Deno.env.get("PUBLIC_APP_HOST") ?? "packalong.app";
+  const appHost = Deno.env.get("PUBLIC_APP_HOST") ?? "packalong.org";
   const downloadUrl = `https://${appHost}`;
   if (joinToken && email) {
     const joinUrl = `https://${appHost}/claim/${encodeURIComponent(joinToken)}`;
