@@ -3,7 +3,7 @@
     "apps": [],
     "details": [
       {
-        "appID": "REPLACE_TEAMID.REPLACE_BUNDLE_ID",
+        "appID": "DFM464QS5A.app.tvelope.packalong",
         "paths": [
           "/claim/*",
           "/trip/*",
