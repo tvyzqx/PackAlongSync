@@ -27,8 +27,11 @@ host `api.7-tm.de` no longer needs to appear in public share links.
 
 ## Prerequisites
 
-1. **DNS** — DONE. Cloudflare wildcard `*.packalong.org` + root, proxied
-   (orange), NS `adele/plato.ns.cloudflare.com`. Covers www + sync.
+1. **DNS** — Cloudflare, proxied (orange), NS `adele/plato.ns.cloudflare.com`.
+   A wildcard `*.packalong.org` covers `www` and `sync` but **NOT the bare
+   apex** — add an explicit apex record too:
+   `A  @  → 188.194.136.17` (proxied). The apex is required: deep links and
+   the app-association file live on `https://packalong.org` (not www).
 2. **iOS app** — DONE. appID `DFM464QS5A.app.tvelope.packalong`,
    App Store `https://apps.apple.com/app/id6767585993`. (Android not
    published yet → assetlinks.json deferred, see note below.)
