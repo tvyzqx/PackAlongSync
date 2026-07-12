@@ -17,7 +17,10 @@
 // the guest's address, so the public link is not itself a join credential —
 // join-circle only admits a caller authenticated as that email.
 
-import { createClient, type SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
+import {
+  createPackalongAdmin,
+  type PackalongClient,
+} from "../_shared/packalong_client.ts";
 
 // Light best-effort rate limiting. The edge isolate is reused across
 // requests, so a module-level map survives between calls in the same worker.
@@ -79,9 +82,7 @@ Deno.serve(async (req) => {
       return htmlResponse(errorPage("Link unvollständig", "Dieser Link enthält kein Token."), 400);
     }
 
-    const admin = createClient(url, serviceRoleKey, {
-      db: { schema: "packalong" },
-    });
+    const admin = createPackalongAdmin(url, serviceRoleKey);
 
     const { data: link, error: linkError } = await admin
       .from("guest_share_links")

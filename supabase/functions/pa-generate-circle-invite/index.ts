@@ -22,7 +22,10 @@
 // retire any still-open token for that (profile, circle) pair so two
 // devices can't race for the same slot.
 
-import { createClient, type SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
+import {
+  createPackalongAdmin,
+  type PackalongClient,
+} from "../_shared/packalong_client.ts";
 
 const VALID_ROLES = ["owner", "member", "viewer"] as const;
 type InvitedRole = typeof VALID_ROLES[number];
@@ -56,9 +59,7 @@ Deno.serve(async (req) => {
       return json({ error: "Server auth is not configured." }, 500);
     }
 
-    const admin = createClient(url, serviceRoleKey, {
-      db: { schema: "packalong" },
-    });
+    const admin = createPackalongAdmin(url, serviceRoleKey);
 
     const { data: userData, error: userError } = await admin.auth.getUser(jwt);
     if (userError || !userData.user) {
@@ -194,7 +195,7 @@ type CheckSuccess = { ok: true; profileId: string };
 type CheckFailure = { ok: false; status: number; error: string; code?: string };
 
 async function assertCallerIsCircleOwner(
-  admin: SupabaseClient,
+  admin: PackalongClient,
   callerId: string,
   circleId: string,
 ): Promise<CheckSuccess | CheckFailure> {
@@ -242,7 +243,7 @@ type ProfileCheck =
   | { ok: false; status: number; error: string; code?: string };
 
 async function assertPreassignableProfile(
-  admin: SupabaseClient,
+  admin: PackalongClient,
   profileId: string,
   circleId: string,
 ): Promise<ProfileCheck> {
@@ -291,7 +292,7 @@ async function assertPreassignableProfile(
 }
 
 async function sendInviteEmail(
-  admin: SupabaseClient,
+  admin: PackalongClient,
   email: string,
   redirectTo: string,
   token: string,

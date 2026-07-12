@@ -29,7 +29,12 @@
 // after the auth-user creation fails we unwind in reverse order so a
 // retry isn't blocked by partial state.
 
-import { createClient, type SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { evaluateJoinGate } from "../_shared/invite_gate.ts";
+import {
+  createPackalongAdmin,
+  type PackalongClient,
+} from "../_shared/packalong_client.ts";
 
 const VALID_ROLES = ["owner", "member", "viewer"] as const;
 type InvitedRole = typeof VALID_ROLES[number];
@@ -86,9 +91,7 @@ Deno.serve(async (req) => {
     const memberName = stringValue(body?.memberName);
     if (!token) return json({ error: "Token is required." }, 400);
 
-    const admin = createClient(url, serviceRoleKey, {
-      db: { schema: "packalong" },
-    });
+    const admin = createPackalongAdmin(url, serviceRoleKey);
 
     const { data: rawInvite, error: tokenError } = await admin
       .from("circle_invites")
@@ -131,32 +134,31 @@ Deno.serve(async (req) => {
       }
     }
 
-    // Email binding: when the invite carries an email_target, redemption is
-    // restricted to that address. provisionAuthUser already enforces this on
-    // the anonymous path (it mints the auth user *as* email_target). The JWT
-    // path (an already-logged-in user) previously trusted the session
-    // blindly — so anyone with the public share link could join as
-    // themselves. Enforce the same binding here: the caller's own address
-    // must match, case-insensitively, or it's a 403.
-    const isEmailBound = typeof invite.email_target === "string" &&
-      invite.email_target.trim().length > 0;
+    // ── Security gate (ADR-13 / Issue #1 hardening) ───────────────────────
+    // The companion invite behind a public guest-view page is email-bound
+    // ('email'), and its /claim/<token> is printed on that page — so the token
+    // is NOT a bearer credential. Redeeming any non-'qr' invite therefore
+    // requires a verified session whose email equals email_target (established
+    // via the OTP / magic-link flow). Only 'qr' (in-person scan) may mint an
+    // anonymous account. The decision lives in the shared, unit-tested gate.
+    //
+    // This closes the hole where the anonymous path (provisionAuthUser) would
+    // mint an auth user *as* email_target from a caller-chosen password, with
+    // no proof the caller controls that address — i.e. a stranger holding the
+    // public companion token could have joined the circle.
+    const gate = evaluateJoinGate({
+      deliveryChannel: invite.delivery_channel,
+      emailTarget: invite.email_target,
+      callerEmail: preAuthUserEmail,
+    });
+    if (!gate.allow) {
+      return json({ error: gate.error, code: gate.code }, gate.status);
+    }
 
     if (preAuthUserId) {
-      if (
-        isEmailBound &&
-        (preAuthUserEmail ?? "").toLowerCase() !==
-          invite.email_target!.trim().toLowerCase()
-      ) {
-        return json(
-          {
-            error: "This invite is bound to a different email address.",
-            code: "email_mismatch",
-          },
-          403,
-        );
-      }
       callerId = preAuthUserId;
     } else {
+      // Reachable only for 'qr' invites (allowAnonymous), enforced by the gate.
       const provision = await provisionAuthUser({
         admin,
         invite,
@@ -377,7 +379,7 @@ Deno.serve(async (req) => {
 // helpers -----------------------------------------------------------------
 
 async function linkPreassignedProfile(
-  admin: SupabaseClient,
+  admin: PackalongClient,
   profileId: string,
   callerId: string,
 ): Promise<
@@ -434,7 +436,7 @@ async function linkPreassignedProfile(
 }
 
 async function reuseOrCreateProfile(
-  admin: SupabaseClient,
+  admin: PackalongClient,
   callerId: string,
   memberName: string,
 ): Promise<
@@ -473,10 +475,10 @@ async function reuseOrCreateProfile(
 async function provisionAuthUser({
   admin,
   invite,
-  receiverPassword,
+  receiverPassword: _receiverPassword,
   deviceLabel,
 }: {
-  admin: SupabaseClient;
+  admin: PackalongClient;
   invite: InviteRow;
   receiverPassword: string;
   deviceLabel: string;
@@ -484,29 +486,15 @@ async function provisionAuthUser({
   | { userId: string; email: string; password: string }
   | { errorResponse: Response }
 > {
-  const isEmailBound = typeof invite.email_target === "string" &&
-    invite.email_target.trim().length > 0;
-
-  let email: string;
-  let password: string;
-  if (isEmailBound) {
-    if (receiverPassword.length < 8) {
-      return {
-        errorResponse: json(
-          {
-            error: "Password must be at least 8 characters.",
-            code: "password_required",
-          },
-          400,
-        ),
-      };
-    }
-    email = invite.email_target!.trim().toLowerCase();
-    password = receiverPassword;
-  } else {
-    email = `join-${crypto.randomUUID()}@packalong.local`;
-    password = randomToken(36);
-  }
+  // Anonymous provisioning is reachable only for 'qr' (in-person) invites,
+  // which are never bound to an address — the caller gate in the handler
+  // rejects every 'link'/'email' invite that lacks a matching verified
+  // session. We therefore always mint a synthetic device account; binding an
+  // account to invite.email_target here (as an earlier version did) would let
+  // a forwarded/public companion token register into the circle without
+  // proving email ownership, so that path is intentionally gone.
+  const email = `join-${crypto.randomUUID()}@packalong.local`;
+  const password = randomToken(36);
 
   const { data: created, error: createError } = await admin.auth.admin
     .createUser({
@@ -517,24 +505,13 @@ async function provisionAuthUser({
         circle_id: invite.circle_id,
         device_label: deviceLabel,
         delivery_channel: invite.delivery_channel,
-        email_bound: isEmailBound,
+        email_bound: false,
       },
     });
   if (createError || !created.user) {
-    const message = String(createError?.message ?? "Could not create device account.");
-    if (isEmailBound &&
-        (/already.*registered/i.test(message) || /already exists/i.test(message))) {
-      return {
-        errorResponse: json(
-          {
-            error:
-              "An account with this email already exists. Sign in first, then redeem the invite again.",
-            code: "user_already_exists",
-          },
-          409,
-        ),
-      };
-    }
+    const message = String(
+      createError?.message ?? "Could not create device account.",
+    );
     throw createError ?? new Error(message);
   }
   return { userId: created.user.id, email, password };

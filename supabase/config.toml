@@ -39,38 +39,43 @@ additional_redirect_urls = [
 [functions]
 verify_jwt = true
 
+# All PackAlong edge functions are deployed under the `pa-` slug so they don't
+# collide with the other apps (familyfocal, rallye) that share this Supabase
+# project. Slug == directory name == the endpoint the app invokes
+# (CircleJoinBackendService.kEdgeFunctionPrefix = 'pa-'), so there is no
+# deploy-time renaming to keep in sync. The `pa-` prefix is the endpoint twin
+# of the `packalong` DB schema (see _shared/packalong_client.ts).
+
 # First-time signup — caller already has a JWT after signUpWithPassword.
 # auth.getUser(jwt) is used to derive caller.id (Plan 5.1).
-[functions.bootstrap-account]
+[functions.pa-bootstrap-account]
 verify_jwt = true
 
 # Authenticated owner creates an additional circle (e.g. "Wandern Mike").
-[functions.create-circle]
+[functions.pa-create-circle]
 verify_jwt = true
 
 # Owner must be authenticated to issue an invite for a circle they own.
-[functions.generate-circle-invite]
+[functions.pa-generate-circle-invite]
 verify_jwt = true
 
 # Owner mints a public guest-view share link (+ optional email-bound
-# companion invite) for one guest on one trip. Deployed as
-# pa-generate-guest-share.
-[functions.generate-guest-share]
+# companion invite) for one guest on one trip.
+[functions.pa-generate-guest-share]
 verify_jwt = true
 
 # Public read-only guest packing-list page. Anonymous by design (the token
 # is the credential); reads run with the service role inside the function.
-# Deployed as pa-guest-view.
-[functions.guest-view]
+[functions.pa-guest-view]
 verify_jwt = false
 
 # Receiver may redeem a token either anonymously (QR scan before login)
 # or with an existing session (cross-circle join). Endpoint must accept
 # anonymous calls; Plan 5.4 branches on whether a JWT is present.
-[functions.join-circle]
+[functions.pa-join-circle]
 verify_jwt = false
 
 # Owner polls to see whether a token they issued has been claimed —
 # gated by JWT.
-[functions.check-join-status]
+[functions.pa-check-join-status]
 verify_jwt = true

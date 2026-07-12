@@ -10,7 +10,7 @@
 // 1:1 port of the v2 check-join-status (archive/v2/) — only the table
 // name changed (join_tokens -> circle_invites, ADR-2 v3 pivot).
 
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { createPackalongAdmin } from "../_shared/packalong_client.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -32,9 +32,7 @@ Deno.serve(async (req) => {
       return json({ error: "Server auth is not configured." }, 500);
     }
 
-    const admin = createClient(url, serviceRoleKey, {
-      db: { schema: "packalong" },
-    });
+    const admin = createPackalongAdmin(url, serviceRoleKey);
     const { data: userData, error: userError } = await admin.auth.getUser(jwt);
     if (userError || !userData.user) {
       return json({ error: "Unauthorized" }, 401);

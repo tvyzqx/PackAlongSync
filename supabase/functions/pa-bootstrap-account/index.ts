@@ -27,7 +27,11 @@
 // We deliberately never delete the auth user from here — that's the
 // client's domain (it owns the session and the sign-up flow).
 
-import { createClient, type SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import {
+  createPackalongAdmin,
+  type PackalongClient,
+} from "../_shared/packalong_client.ts";
 
 const DEFAULT_CIRCLE_NAME = "Mein Haushalt";
 
@@ -79,9 +83,7 @@ Deno.serve(async (req) => {
       return json({ error: "owner_name is required." }, 400);
     }
 
-    const admin = createClient(url, serviceRoleKey, {
-      db: { schema: "packalong" },
-    });
+    const admin = createPackalongAdmin(url, serviceRoleKey);
 
     // 2. Idempotency probe. ADR-5 guarantees at most one profile per auth
     //    user via a partial unique index, so maybeSingle() is exact.
@@ -157,7 +159,7 @@ Deno.serve(async (req) => {
 });
 
 async function createCircleAndMembership(
-  admin: SupabaseClient,
+  admin: PackalongClient,
   callerId: string,
   profileId: string,
   circleName: string,

@@ -9,7 +9,11 @@
 // runs first; if a client somehow lands here without one we surface
 // 409 / profile_missing so the UI can route the user back to onboarding.
 
-import { createClient, type SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import {
+  createPackalongAdmin,
+  type PackalongClient,
+} from "../_shared/packalong_client.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -54,9 +58,7 @@ Deno.serve(async (req) => {
       return json({ error: "name is required." }, 400);
     }
 
-    const admin = createClient(url, serviceRoleKey, {
-      db: { schema: "packalong" },
-    });
+    const admin = createPackalongAdmin(url, serviceRoleKey);
 
     // ADR-5: at most one profile per auth user. If there's none the
     // caller skipped bootstrap-account; abort with a distinct code so
@@ -98,7 +100,7 @@ Deno.serve(async (req) => {
 });
 
 async function createCircleAndMembership(
-  admin: SupabaseClient,
+  admin: PackalongClient,
   callerId: string,
   profileId: string,
   fields: { name: string; iconEmoji: string | null; color: string | null },

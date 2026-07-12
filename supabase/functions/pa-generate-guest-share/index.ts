@@ -19,7 +19,10 @@
 // The share link itself is served by service role in pa-guest-view, never via
 // RLS, so guest_share_links rows are opaque to the anon role.
 
-import { createClient, type SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
+import {
+  createPackalongAdmin,
+  type PackalongClient,
+} from "../_shared/packalong_client.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -47,9 +50,7 @@ Deno.serve(async (req) => {
       return json({ error: "Server auth is not configured." }, 500);
     }
 
-    const admin = createClient(url, serviceRoleKey, {
-      db: { schema: "packalong" },
-    });
+    const admin = createPackalongAdmin(url, serviceRoleKey);
 
     const { data: userData, error: userError } = await admin.auth.getUser(jwt);
     if (userError || !userData.user) {
@@ -170,7 +171,7 @@ type OwnerSuccess = { ok: true; profileId: string };
 type CheckFailure = { ok: false; status: number; error: string; code?: string };
 
 async function assertCallerIsCircleOwner(
-  admin: SupabaseClient,
+  admin: PackalongClient,
   callerId: string,
   circleId: string,
 ): Promise<OwnerSuccess | CheckFailure> {
@@ -216,7 +217,7 @@ async function assertCallerIsCircleOwner(
 type GuestSuccess = { ok: true; email: string | null };
 
 async function assertShareableGuest(
-  admin: SupabaseClient,
+  admin: PackalongClient,
   profileId: string,
   tripId: string,
 ): Promise<GuestSuccess | CheckFailure> {
@@ -267,7 +268,7 @@ async function assertShareableGuest(
 }
 
 async function retireOpenShareLinks(
-  admin: SupabaseClient,
+  admin: PackalongClient,
   profileId: string,
   tripId: string,
 ): Promise<void> {

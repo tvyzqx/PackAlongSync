@@ -104,12 +104,31 @@ You should see `trips`, `items`, `persons`, `pack_containers`, `tags`, `particip
 
 ### 3. Deploy the edge functions
 
+All PackAlong v3 functions are deployed under the `pa-` slug so they don't
+collide with the other apps (familyfocal, rallye) sharing this Supabase
+project. The directory name **is** the deployed slug **is** the endpoint the
+app calls — no renaming step. `_shared/` holds imported helpers only and is
+not a deployable function.
+
 ```bash
+# v3 circle / guest-share functions (invoked by the app with the pa- prefix)
+supabase functions deploy pa-bootstrap-account
+supabase functions deploy pa-create-circle
+supabase functions deploy pa-delete-circle
+supabase functions deploy pa-generate-circle-invite
+supabase functions deploy pa-join-circle
+supabase functions deploy pa-check-join-status
+supabase functions deploy pa-generate-guest-share
+supabase functions deploy pa-guest-view
+
+# legacy functions (invoked without a prefix — keep their bare names)
 supabase functions deploy claim-person
-supabase functions deploy generate-join-token
-supabase functions deploy join-trip
 supabase functions deploy upgrade-guest-account
 ```
+
+`pa-guest-view` renders the public read-only packing list; `pa-generate-guest-share`
+mints its token plus the email-bound companion invite. Both rely on migrations
+`019_profile_email` and `020_guest_share_links`, so run `supabase db push` first.
 
 Set the join-token expiry (in minutes; default 7 days):
 

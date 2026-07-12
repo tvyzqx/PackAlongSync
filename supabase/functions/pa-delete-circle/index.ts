@@ -16,6 +16,7 @@
 // the owner check, the service-role client performs the writes.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { createPackalongAdmin } from "../_shared/packalong_client.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -57,9 +58,7 @@ Deno.serve(async (req) => {
       return json({ error: "circle_id is required." }, 400);
     }
 
-    const admin = createClient(url, serviceRoleKey, {
-      db: { schema: "packalong" },
-    });
+    const admin = createPackalongAdmin(url, serviceRoleKey);
 
     // Resolve the caller's profile (ADR-5: at most one per auth user), then
     // verify they hold an `owner` membership in the target circle. service_role
