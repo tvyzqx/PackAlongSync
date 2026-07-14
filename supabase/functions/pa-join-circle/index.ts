@@ -177,14 +177,27 @@ Deno.serve(async (req) => {
     let createdProfileId: string | null = null;
     let linkedPreassignedProfileId: string | null = null;
     let membershipCreated = false;
+    let membershipReactivated = false;
+    let membershipProfileId: string | null = null;
     const rollback = async () => {
-      if (membershipCreated) {
+      if (membershipCreated && membershipProfileId) {
         try {
           await admin
             .from("circle_members")
             .delete()
             .eq("circle_id", invite.circle_id)
-            .eq("profile_id", createdProfileId ?? linkedPreassignedProfileId ?? "");
+            .eq("profile_id", membershipProfileId);
+        } catch (_) { /* best effort */ }
+      }
+      if (membershipReactivated && membershipProfileId) {
+        // We flipped a previously-removed member back to active; undo that so
+        // a failed join doesn't silently re-admit someone.
+        try {
+          await admin
+            .from("circle_members")
+            .update({ deleted: true, updated_at: new Date().toISOString() })
+            .eq("circle_id", invite.circle_id)
+            .eq("profile_id", membershipProfileId);
         } catch (_) { /* best effort */ }
       }
       if (linkedPreassignedProfileId) {
@@ -275,6 +288,7 @@ Deno.serve(async (req) => {
           .eq("profile_id", profile.id)
           .maybeSingle();
       if (membershipLookupError) throw membershipLookupError;
+      membershipProfileId = profile.id;
       if (!existingMembership) {
         const { error: insertError } = await admin
           .from("circle_members")
@@ -285,11 +299,30 @@ Deno.serve(async (req) => {
           });
         if (insertError) throw insertError;
         membershipCreated = true;
+      } else if (existingMembership.deleted) {
+        // The member was previously removed (soft-deleted circle_members row).
+        // Redeeming a fresh invite is the owner's explicit act of re-adding
+        // them, so reactivate the existing row instead of leaving a stale
+        // tombstone that keeps them out (the old behaviour). We reset role to
+        // the invited role — repairing any drifted role — and bump
+        // joined_at/updated_at so the reactivation rides the normal
+        // incremental pull to every device. This makes remove <-> re-add
+        // symmetric and idempotent (ADR-10).
+        const now = new Date().toISOString();
+        const { error: reactivateError } = await admin
+          .from("circle_members")
+          .update({
+            deleted: false,
+            role: invitedRole,
+            joined_at: now,
+            updated_at: now,
+          })
+          .eq("circle_id", invite.circle_id)
+          .eq("profile_id", profile.id);
+        if (reactivateError) throw reactivateError;
+        membershipReactivated = true;
       }
-      // If the membership exists and is soft-deleted, we intentionally
-      // leave it alone — a stale deleted=true row probably encodes an
-      // owner-initiated kick; reactivating would be surprising. The owner
-      // can flip the flag manually.
+      // An already-active membership is left untouched — re-join is a no-op.
     } catch (downstream) {
       await rollback();
       throw downstream;
