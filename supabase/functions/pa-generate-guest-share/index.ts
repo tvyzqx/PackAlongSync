@@ -44,10 +44,15 @@ Deno.serve(async (req) => {
     // https://api.7-tm.de); on managed Supabase it equals SUPABASE_URL.
     const publicUrl = Deno.env.get("SUPABASE_PUBLIC_URL") ?? url;
     const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+    // Missing env is the operator's problem (500); a missing token is the
+    // caller's (401). Same split as pa-delete-circle et al.
+    if (!url || !serviceRoleKey) {
+      return json({ error: "Server auth is not configured." }, 500);
+    }
     const authHeader = req.headers.get("Authorization") ?? "";
     const jwt = authHeader.replace(/^Bearer\s+/i, "").trim();
-    if (!url || !serviceRoleKey || !jwt) {
-      return json({ error: "Server auth is not configured." }, 500);
+    if (!jwt) {
+      return json({ error: "Missing Authorization bearer token." }, 401);
     }
 
     const admin = createPackalongAdmin(url, serviceRoleKey);
