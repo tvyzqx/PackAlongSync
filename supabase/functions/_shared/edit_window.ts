@@ -5,44 +5,51 @@
 // pa-guest-view handler so the rule can be unit-tested against DST edges and
 // so both the page render and the save path answer the question the same way.
 //
-// The rule, in one sentence: a guest may set the status of their own items
-// until the END of the trip's start day, inclusive, in EDIT_TIMEZONE — and a
-// trip without a start_date has no cutoff at all.
+// The rule, in one sentence: a guest may edit their own items — outbound
+// status AND return-packed — until the END of the trip's last day, inclusive,
+// in EDIT_TIMEZONE, and a trip without an end_date has no cutoff at all.
 //
-// Why inclusive-to-end-of-day: the packing happens ON the departure day, so
-// cutting off at the start_date instant (often midnight, or whatever time the
-// owner happened to pick) would close the page exactly when the guest needs
-// it. Once the trip is under way the list becomes a record of what was packed
-// and freezes; the page keeps serving that read-only view past end_date until
-// expires_at or a revoke closes it.
+// Why the trip's END and not its start: the page carries both packing
+// directions (see pa-guest-view). Return-packing happens ON the trip, so a
+// cutoff at departure would close the half of the page that is only just
+// becoming useful. Running both directions off one date keeps the page a
+// single mode — editable or not — instead of two tabs disagreeing about
+// whether they are live. Once the trip is over the list becomes a record and
+// freezes; the page keeps serving that read-only view until expires_at or a
+// revoke closes it.
+//
+// Why inclusive-to-end-of-day: end_date is a timestamptz, so it lands on some
+// specific time of day — often midnight, i.e. the very start of the last day.
+// Cutting off there would shut the page a full day early, on a date the guest
+// can see printed above the list.
 
 /**
- * The trip's start day is "over" at midnight in this zone. The product is
- * German-facing and trips.start_date is a timestamptz, so an absolute instant
+ * The trip's last day is "over" at midnight in this zone. The product is
+ * German-facing and trips.end_date is a timestamptz, so an absolute instant
  * needs a zone to be turned back into a calendar day the guest recognises.
  */
 export const EDIT_TIMEZONE = "Europe/Berlin";
 
 /**
- * True while the guest may still edit: no start date at all, or the start day
- * has not yet ended in [timeZone].
+ * True while the guest may still edit: no end date at all, or the trip's last
+ * day has not yet ended in [timeZone].
  *
- * [startDate] is the trip's start_date as stored (an ISO timestamptz) or null.
+ * [endDate] is the trip's end_date as stored (an ISO timestamptz) or null.
  * [now] defaults to the current instant; tests pass it explicitly.
  *
- * An unparseable start_date falls open rather than shut: the cutoff is a
+ * An unparseable end_date falls open rather than shut: the cutoff is a
  * convenience, not a security boundary (the token's scope is), so bad data
  * should not silently strand a guest.
  */
 export function withinEditWindow(
-  startDate: string | null,
+  endDate: string | null,
   now: Date = new Date(),
   timeZone: string = EDIT_TIMEZONE,
 ): boolean {
-  if (!startDate) return true;
-  const start = new Date(startDate);
-  if (Number.isNaN(start.getTime())) return true;
-  return now.getTime() <= endOfDayUtcMs(start, timeZone);
+  if (!endDate) return true;
+  const end = new Date(endDate);
+  if (Number.isNaN(end.getTime())) return true;
+  return now.getTime() <= endOfDayUtcMs(end, timeZone);
 }
 
 /**

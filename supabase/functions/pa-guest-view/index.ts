@@ -12,22 +12,32 @@
 // trip, that guest's own items. Defenses: unguessable token, optional expiry,
 // revoke flag, and light per-IP rate limiting.
 //
-// The guest may set the status of their own items while the trip has not
-// started yet (see EDIT WINDOW below). Edits are staged in the browser and
-// POSTed back in one batch when the guest presses save — there is no live
-// sync from this page. The write path re-resolves the link and re-checks the
-// edit window server-side; the browser is never trusted with scope. Because
-// every guest link is writable during that window, the token IS a write
-// credential for exactly one guest's items on one trip: worst case a leaked
-// link means wrong checkboxes, never data exposure beyond what the page
-// already shows. Writes touch only items.status, so the circle picks the
-// change up through the normal updated_at/realtime path with no attribution
-// of who flipped it — deliberately, per product decision.
+// The guest may edit their own items while the trip is not over (see EDIT
+// WINDOW below). Edits are staged in the browser and POSTed back in one batch
+// when the guest presses save — there is no live sync from this page. The
+// write path re-resolves the link and re-checks the edit window server-side;
+// the browser is never trusted with scope. Because every guest link is
+// writable during that window, the token IS a write credential for exactly one
+// guest's items on one trip: worst case a leaked link means wrong checkboxes,
+// never data exposure beyond what the page already shows. Writes touch only
+// the packing fields below, so the circle picks changes up through the normal
+// updated_at/realtime path with no attribution of who flipped what —
+// deliberately, per product decision.
 //
-// EDIT WINDOW: editable until the END of the trip's start day (inclusive) in
-// EDIT_TIMEZONE. A trip without a start_date has no cutoff and stays editable
-// for the life of the link. Once the trip has started the page falls back to
-// the read-only rendering, and it keeps serving that view past end_date until
+// TWO DIRECTIONS: the app's trip screen has a Hinpacken/Rückpacken segmented
+// switch (PackDirection in the Flutter app), and this page mirrors it as two
+// tabs over one and the same item list — that is what the data says too, since
+// "return list" is not a second set of rows but the return_packed flag on the
+// same items. Outbound carries the five-way items.status; return is a plain
+// boolean. Ticking return-packed also stamps return_packed_at (now / null),
+// exactly as ItemsRepository.setReturnPacked does in the app, so rows written
+// here are indistinguishable from rows written on a device.
+//
+// EDIT WINDOW: editable until the END of the trip's last day (inclusive) in
+// EDIT_TIMEZONE — both directions, one rule, so the two tabs can never
+// disagree about whether they are live. A trip without an end_date has no
+// cutoff and stays editable for the life of the link. Once the trip is over
+// the page falls back to the read-only rendering and keeps serving it until
 // expires_at or a revoke closes it.
 //
 // When the guest profile has an email and a live companion invite, the page
@@ -86,12 +96,21 @@ type ItemRow = {
   id: string;
   title: string;
   status: string;
+  return_packed: boolean;
   quantity: number;
   note: string | null;
   container_id: string | null;
   category: string | null;
   sort_order: number;
 };
+
+/**
+ * One staged edit from the browser, already validated. Exactly one direction
+ * per change: `status` for outbound, `returnPacked` for the way home.
+ */
+type Change =
+  | { id: string; kind: "status"; status: string }
+  | { id: string; kind: "return"; returnPacked: boolean };
 
 type ShareLink = {
   token: string;
@@ -264,7 +283,7 @@ Deno.serve(async (req) => {
       containersById,
       joinToken,
       token,
-      editable: withinEditWindow(trip.start_date as string | null),
+      editable: withinEditWindow(trip.end_date as string | null),
     });
     return htmlResponse(page, 200);
   } catch (_error) {
@@ -284,7 +303,7 @@ async function loadGuestItems(
 ): Promise<ItemRow[]> {
   const { data, error } = await admin
     .from("items")
-    .select("id, title, status, quantity, note, container_id, category, sort_order")
+    .select("id, title, status, return_packed, quantity, note, container_id, category, sort_order")
     .eq("trip_id", link.trip_id)
     .eq("deleted", false)
     .or(`pack_list_person_id.eq.${link.profile_id},assigned_to_person_id.eq.${link.profile_id}`);
@@ -339,16 +358,33 @@ async function handleSave(req: Request, clientIp: string): Promise<Response> {
       return jsonResponse({ error: "Zu viele Änderungen auf einmal." }, 400);
     }
 
-    const changes: { id: string; status: string }[] = [];
+    // Each change names its direction by which field it carries. Requiring
+    // exactly one keeps a payload from quietly writing both.
+    const changes: Change[] = [];
     for (const raw of body.changes) {
-      const change = raw as { id?: unknown; status?: unknown };
-      if (typeof change.id !== "string" || typeof change.status !== "string") {
+      const change = raw as { id?: unknown; status?: unknown; returnPacked?: unknown };
+      if (typeof change.id !== "string") {
         return jsonResponse({ error: "Ungültige Anfrage." }, 400);
       }
-      if (!GUEST_SETTABLE_STATUSES.has(change.status)) {
-        return jsonResponse({ error: "Unbekannter Status." }, 400);
+      const hasStatus = change.status !== undefined;
+      const hasReturn = change.returnPacked !== undefined;
+      if (hasStatus === hasReturn) {
+        return jsonResponse({ error: "Ungültige Anfrage." }, 400);
       }
-      changes.push({ id: change.id, status: change.status });
+      if (hasStatus) {
+        if (typeof change.status !== "string") {
+          return jsonResponse({ error: "Ungültige Anfrage." }, 400);
+        }
+        if (!GUEST_SETTABLE_STATUSES.has(change.status)) {
+          return jsonResponse({ error: "Unbekannter Status." }, 400);
+        }
+        changes.push({ id: change.id, kind: "status", status: change.status });
+      } else {
+        if (typeof change.returnPacked !== "boolean") {
+          return jsonResponse({ error: "Ungültige Anfrage." }, 400);
+        }
+        changes.push({ id: change.id, kind: "return", returnPacked: change.returnPacked });
+      }
     }
 
     const admin = createPackalongAdmin(url, serviceRoleKey);
@@ -360,17 +396,17 @@ async function handleSave(req: Request, clientIp: string): Promise<Response> {
 
     const { data: trip, error: tripError } = await admin
       .from("trips")
-      .select("start_date, deleted")
+      .select("end_date, deleted")
       .eq("id", link.trip_id)
       .maybeSingle();
     if (tripError) throw tripError;
     if (!trip || trip.deleted) {
       return jsonResponse({ error: "Diese Reise existiert nicht mehr." }, 404);
     }
-    // The page may have sat open since before the trip started.
-    if (!withinEditWindow(trip.start_date as string | null)) {
+    // The page may have sat open since before the trip ended.
+    if (!withinEditWindow(trip.end_date as string | null)) {
       return jsonResponse(
-        { error: "Die Reise hat begonnen — die Liste kann nicht mehr geändert werden." },
+        { error: "Die Reise ist vorbei — die Liste kann nicht mehr geändert werden." },
         409,
       );
     }
@@ -384,9 +420,18 @@ async function handleSave(req: Request, clientIp: string): Promise<Response> {
     let saved = 0;
     for (const change of changes) {
       if (!allowedIds.has(change.id)) continue;
+      // return_packed_at mirrors ItemsRepository.setReturnPacked in the app:
+      // stamped when the item is packed for the way home, cleared when the
+      // guest takes the tick back.
+      const patch = change.kind === "status"
+        ? { status: change.status }
+        : {
+          return_packed: change.returnPacked,
+          return_packed_at: change.returnPacked ? new Date().toISOString() : null,
+        };
       const { error } = await admin
         .from("items")
-        .update({ status: change.status })
+        .update(patch)
         .eq("id", change.id)
         .eq("trip_id", link.trip_id)
         .eq("deleted", false);
@@ -423,6 +468,14 @@ const NO_CATEGORY = "Sonstiges";
 // for the dropdown: the two everyday answers first.
 const STATUS_CHOICES = ["open", "packed", "toBuy", "unclear", "planning"];
 
+// Tab wording follows the app's segmented switch (l10n packDirectionOutbound /
+// packDirectionReturn / packDirectionReturnBanner) so a guest who later
+// installs PackAlong meets the same two words.
+const DIRECTION_META = {
+  outbound: { emoji: "🧳", label: "Hinpacken" },
+  return: { emoji: "↩️", label: "Rückpacken" },
+};
+
 function renderPage({
   trip,
   guest,
@@ -446,11 +499,15 @@ function renderPage({
   const guestName = esc((guest.name as string | null) ?? "Gast");
   const guestEmoji = (guest.avatar_emoji as string | null) || "🙂";
 
-  const packed = items.filter((i) => i.status === "packed").length;
+  const packedOut = items.filter((i) => i.status === "packed").length;
+  const packedReturn = items.filter((i) => i.return_packed).length;
   const total = items.length;
 
   // Editing needs something to edit; an empty list stays a plain page.
   const canEdit = editable && total > 0;
+  // Both directions render at once and CSS shows one; the tabs only make sense
+  // once there is a list to switch between.
+  const showTabs = total > 0;
 
   const groups = groupItems(items, containersById);
   const listHtml = total === 0
@@ -459,7 +516,7 @@ function renderPage({
 
   const joinHtml = renderJoinBlock(guest.email as string | null, joinToken);
 
-  return `<main${canEdit ? ' class="editable"' : ""}>
+  return `<main class="dir-outbound${canEdit ? " editable" : ""}">
   <header class="hero">
     <div class="trip-emoji">${esc(tripEmoji)}</div>
     <h1>${tripTitle}</h1>
@@ -468,21 +525,22 @@ function renderPage({
       <span class="guest-emoji">${esc(guestEmoji)}</span>
       <span>Packliste für <strong>${guestName}</strong></span>
     </div>
-    ${total > 0 ? `<p class="progress">${packed} von ${total} gepackt</p>` : ""}
     ${
-    canEdit
-      ? `<p class="hint edit-hint">Du kannst den Status deiner Sachen ändern. Zum Übernehmen unten speichern.</p>`
-      : total > 0
-      ? `<p class="hint">Diese Ansicht ist nur zum Anschauen.</p>`
+    total > 0
+      ? `<p class="progress only-outbound">${packedOut} von ${total} gepackt</p>
+    <p class="progress only-return">${packedReturn} von ${total} wieder eingepackt</p>`
       : ""
   }
+    ${renderDirectionHint(canEdit, total)}
   </header>
+
+  ${showTabs ? renderTabs() : ""}
 
   <section class="list">
     ${listHtml}
   </section>
 
-  ${canEdit ? renderSaveBar(token) : ""}
+  ${canEdit ? renderSaveBar() : ""}
 
   ${joinHtml}
 
@@ -494,6 +552,7 @@ function renderPage({
     </p>
     <p class="brand">PackAlong</p>
   </footer>
+  ${showTabs ? `<script>${pageScript(canEdit ? token : null)}</script>` : ""}
 </main>`;
 }
 
@@ -547,6 +606,33 @@ function groupItems(
   return groups;
 }
 
+/**
+ * The line under the header. It differs per direction — "Rückpacken" needs the
+ * app's framing ("was für die Heimreise wieder eingepackt wurde") or a guest
+ * reads the tab as a second, unfamiliar list rather than the same things on
+ * the way home.
+ */
+function renderDirectionHint(canEdit: boolean, total: number): string {
+  if (total === 0) return "";
+  if (!canEdit) {
+    return `<p class="hint only-outbound">Diese Ansicht ist nur zum Anschauen.</p>
+    <p class="hint only-return">Was für die Heimreise wieder eingepackt wurde. Nur zum Anschauen.</p>`;
+  }
+  return `<p class="hint only-outbound">Du kannst den Status deiner Sachen ändern. Zum Übernehmen unten speichern.</p>
+    <p class="hint only-return">Hier hakst du ab, was für die Heimreise wieder eingepackt ist. Zum Übernehmen unten speichern.</p>`;
+}
+
+function renderTabs(): string {
+  const tab = (dir: keyof typeof DIRECTION_META, active: boolean) => {
+    const meta = DIRECTION_META[dir];
+    return `<button type="button" class="tab${active ? " active" : ""}" role="tab"
+      aria-selected="${active}" data-dir="${dir}">${esc(meta.emoji)} ${esc(meta.label)}</button>`;
+  };
+  return `<div class="tabs" role="tablist" aria-label="Packrichtung">
+    ${tab("outbound", true)}${tab("return", false)}
+  </div>`;
+}
+
 function renderContainerGroup(group: ContainerGroup, canEdit: boolean): string {
   const heading = `${group.icon ? esc(group.icon) + " " : ""}${esc(group.name)}`;
   const categories = group.categories.map((category) => {
@@ -561,23 +647,37 @@ function renderContainerGroup(group: ContainerGroup, canEdit: boolean): string {
   </div>`;
 }
 
+/**
+ * Both directions are rendered into every row and CSS reveals the active one
+ * (.only-outbound / .only-return). Rendering the list once and swapping the
+ * control beats two parallel lists: the grouping, the ids and the staged-edit
+ * bookkeeping all stay single-copy, and switching tabs costs no DOM rebuild.
+ */
 function renderItem(item: ItemRow, canEdit: boolean): string {
   const meta = STATUS_META[item.status] ?? STATUS_META.open;
   const qty = item.quantity && item.quantity > 1 ? ` <span class="qty">×${item.quantity}</span>` : "";
   const note = item.note && item.note.trim().length > 0
     ? `<span class="note">${esc(item.note.trim())}</span>`
     : "";
-  const packedClass = item.status === "packed" ? " packed" : "";
+  // Struck-through text is per direction: an item can be packed for the way
+  // out and not yet for the way home.
+  const packedClasses = `${item.status === "packed" ? " packed-out" : ""}${
+    item.return_packed ? " packed-ret" : ""
+  }`;
   const title = `<span class="title">${esc(item.title)}${qty}${note}</span>`;
 
   if (!canEdit) {
-    return `<li class="item${packedClass}">
-    <span class="status" title="${esc(meta.label)}">${esc(meta.emoji)}</span>
+    const returnMeta = item.return_packed
+      ? { emoji: "✅", label: "Wieder eingepackt" }
+      : { emoji: "⬜", label: "Noch nicht wieder eingepackt" };
+    return `<li class="item${packedClasses}">
+    <span class="status only-outbound" title="${esc(meta.label)}">${esc(meta.emoji)}</span>
+    <span class="status only-return" title="${esc(returnMeta.label)}">${esc(returnMeta.emoji)}</span>
     ${title}
   </li>`;
   }
 
-  // data-initial lets the script send only what actually changed, and lets a
+  // data-initial-* lets the script send only what actually changed, and lets a
   // guest undo their way back to a clean state.
   const options = STATUS_CHOICES.map((value) => {
     const optionMeta = STATUS_META[value];
@@ -585,77 +685,115 @@ function renderItem(item: ItemRow, canEdit: boolean): string {
       esc(`${optionMeta.emoji} ${optionMeta.label}`)
     }</option>`;
   }).join("");
-  const label = `Status von ${item.title}`;
-  return `<li class="item${packedClass}" data-item="${esc(item.id)}" data-initial="${esc(item.status)}">
+  return `<li class="item${packedClasses}" data-item="${esc(item.id)}"
+    data-initial-status="${esc(item.status)}" data-initial-return="${item.return_packed}">
     ${title}
-    <select class="status-select" aria-label="${esc(label)}">${options}</select>
+    <select class="status-select only-outbound" aria-label="${esc(`Status von ${item.title}`)}">${options}</select>
+    <label class="return-toggle only-return">
+      <input type="checkbox" class="return-check"${item.return_packed ? " checked" : ""}
+        aria-label="${esc(`${item.title} für die Heimreise eingepackt`)}">
+      <span>Eingepackt</span>
+    </label>
   </li>`;
 }
 
-function renderSaveBar(token: string): string {
+function renderSaveBar(): string {
   return `<div class="savebar" hidden>
     <div class="savebar-inner">
       <span class="savebar-text" role="status"></span>
       <button type="button" class="btn primary save-btn">Speichern</button>
     </div>
-  </div>
-  <script>${saveScript(token)}</script>`;
+  </div>`;
 }
 
 /**
- * Staged editing: selects mutate nothing until the guest saves, at which point
- * the diff against data-initial goes up in one POST. On success the page
- * reloads, so what the guest sees afterwards is server truth rather than the
- * browser's optimistic guess — that also surfaces any item the save skipped
- * because it left the guest's scope meanwhile.
+ * The page's only script. Tabs always; staged editing only when [token] is
+ * non-null (the read-only page still needs the tabs to reach the return list).
+ *
+ * Staged editing: controls mutate nothing until the guest saves, at which
+ * point the diff against data-initial-* goes up in one POST — across BOTH
+ * directions, so switching tabs never silently drops what was staged on the
+ * other one. On success the page reloads, so what the guest sees afterwards is
+ * server truth rather than the browser's optimistic guess; that also surfaces
+ * any item the save skipped because it left the guest's scope meanwhile.
  */
-function saveScript(token: string): string {
+function pageScript(token: string | null): string {
   // Escaping "<" keeps a token from ever closing the <script> element early.
   // Tokens are generator-minted and can't contain one, but the page is the
   // wrong place to rely on that.
-  const literal = JSON.stringify(token).replaceAll("<", "\\u003C");
+  const literal = token === null ? "null" : JSON.stringify(token).replaceAll("<", "\\u003C");
   return `
 (function () {
   var token = ${literal};
+  var main = document.querySelector("main");
+  var tabs = Array.prototype.slice.call(document.querySelectorAll(".tab"));
+
+  tabs.forEach(function (tab) {
+    tab.addEventListener("click", function () {
+      var dir = tab.dataset.dir;
+      main.classList.toggle("dir-outbound", dir === "outbound");
+      main.classList.toggle("dir-return", dir === "return");
+      tabs.forEach(function (other) {
+        var on = other === tab;
+        other.classList.toggle("active", on);
+        other.setAttribute("aria-selected", String(on));
+      });
+    });
+  });
+
+  if (token === null) return;
+
   var bar = document.querySelector(".savebar");
   var text = bar.querySelector(".savebar-text");
   var button = bar.querySelector(".save-btn");
   var items = Array.prototype.slice.call(document.querySelectorAll(".item[data-item]"));
 
-  function changed() {
-    return items.filter(function (li) {
-      return li.querySelector(".status-select").value !== li.dataset.initial;
+  // One staged edit per item per direction, so a guest who packs a thing and
+  // then unpacks it again sends nothing at all.
+  function pending() {
+    var out = [];
+    items.forEach(function (li) {
+      var status = li.querySelector(".status-select").value;
+      if (status !== li.dataset.initialStatus) {
+        out.push({ id: li.dataset.item, status: status });
+      }
+      var ret = li.querySelector(".return-check").checked;
+      if (String(ret) !== li.dataset.initialReturn) {
+        out.push({ id: li.dataset.item, returnPacked: ret });
+      }
     });
+    return out;
   }
 
   function refresh() {
-    var count = changed().length;
+    var count = pending().length;
     bar.hidden = count === 0;
     text.textContent = count === 1 ? "1 Änderung" : count + " Änderungen";
   }
 
   items.forEach(function (li) {
     li.querySelector(".status-select").addEventListener("change", function () {
-      li.classList.toggle("packed", this.value === "packed");
+      li.classList.toggle("packed-out", this.value === "packed");
+      li.classList.add("touched");
+      refresh();
+    });
+    li.querySelector(".return-check").addEventListener("change", function () {
+      li.classList.toggle("packed-ret", this.checked);
       li.classList.add("touched");
       refresh();
     });
   });
 
   button.addEventListener("click", function () {
-    var pending = changed();
-    if (pending.length === 0) return;
+    var changes = pending();
+    if (changes.length === 0) return;
     button.disabled = true;
+    bar.classList.remove("error");
     text.textContent = "Wird gespeichert …";
     fetch(window.location.pathname + window.location.search, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        token: token,
-        changes: pending.map(function (li) {
-          return { id: li.dataset.item, status: li.querySelector(".status-select").value };
-        })
-      })
+      body: JSON.stringify({ token: token, changes: changes })
     }).then(function (res) {
       return res.json().then(function (body) { return { ok: res.ok, body: body }; });
     }).then(function (result) {
@@ -670,7 +808,7 @@ function saveScript(token: string): string {
 
   // Losing staged edits to a stray back-swipe would be annoying.
   window.addEventListener("beforeunload", function (event) {
-    if (!button.disabled && changed().length > 0) event.preventDefault();
+    if (!button.disabled && pending().length > 0) event.preventDefault();
   });
 
   refresh();
@@ -814,16 +952,43 @@ ul { list-style: none; margin: 0; padding: 0; }
 .container-group ul .item:first-child { border-top: none; }
 .item .status { font-size: 15px; flex: 0 0 auto; }
 .item .title { flex: 1 1 auto; }
-.item.packed .title { color: var(--muted); text-decoration: line-through; }
+/* Packed-ness is per direction — an item can be packed for the way out and
+   not yet for the way home — so the strike-through follows the active tab. */
+main.dir-outbound .item.packed-out .title,
+main.dir-return .item.packed-ret .title {
+  color: var(--muted); text-decoration: line-through;
+}
 .qty { color: var(--muted); font-size: 14px; }
 .note { display: block; color: var(--muted); font-size: 13px; margin-top: 2px; }
 .empty { color: var(--muted); text-align: center; padding: 24px 0; }
 .hint { color: var(--muted); font-size: 14px; margin: 12px 0 0; }
+
+/* Direction tabs. Every row carries both controls and both progress lines;
+   these two rules are what makes exactly one direction visible. */
+main.dir-outbound .only-return { display: none; }
+main.dir-return .only-outbound { display: none; }
+.tabs {
+  display: flex; gap: 4px; margin: 0 auto 16px; max-width: 320px;
+  background: var(--card); border: 1px solid var(--line);
+  border-radius: 999px; padding: 4px;
+}
+.tab {
+  flex: 1 1 0; font: inherit; font-size: 14px; font-weight: 600;
+  color: var(--muted); background: none; border: none; cursor: pointer;
+  border-radius: 999px; padding: 8px 10px; white-space: nowrap;
+}
+.tab.active { background: var(--accent); color: var(--accent-fg); }
+
 .status-select {
   flex: 0 0 auto; font: inherit; font-size: 14px; color: var(--fg);
   background: var(--bg); border: 1px solid var(--line);
   border-radius: 8px; padding: 6px 8px; max-width: 45%;
 }
+.return-toggle {
+  flex: 0 0 auto; display: inline-flex; gap: 6px; align-items: center;
+  font-size: 14px; color: var(--muted); cursor: pointer; user-select: none;
+}
+.return-toggle input { width: 20px; height: 20px; accent-color: var(--accent); }
 .item.touched .status-select { border-color: var(--accent); }
 /* Editable rows put the control on the right and align to it. */
 main.editable .item { align-items: center; gap: 12px; }
