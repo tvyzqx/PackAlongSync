@@ -50,6 +50,12 @@ import {
   type PackalongClient,
 } from "../_shared/packalong_client.ts";
 import { withinEditWindow } from "../_shared/edit_window.ts";
+import {
+  negotiateLocale,
+  type StatusKey,
+  type Strings,
+  stringsFor,
+} from "../_shared/guest_i18n.ts";
 
 // Light best-effort rate limiting. The edge isolate is reused across
 // requests, so a module-level map survives between calls in the same worker.
@@ -119,8 +125,34 @@ type ShareLink = {
   companion_invite_token: string | null;
 };
 
-/** Why a link cannot be served, or null when it is live. */
-type LinkRejection = { title: string; message: string; status: number };
+/**
+ * Why a link cannot be served. A reason, not a sentence: resolveLink has no
+ * business knowing the guest's language, so the wording is chosen where the
+ * response is built.
+ */
+type RejectionKind = "notFound" | "revoked" | "expired";
+type LinkRejection = { kind: RejectionKind; status: number };
+
+/** The two-line error page for a rejected link, in the guest's language. */
+function rejectionPage(rejection: LinkRejection, s: Strings): Response {
+  const copy: Record<RejectionKind, { title: string; body: string }> = {
+    notFound: { title: s.errNotFoundTitle, body: s.errNotFoundBody },
+    revoked: { title: s.errRevokedTitle, body: s.errRevokedBody },
+    expired: { title: s.errExpiredTitle, body: s.errExpiredBody },
+  };
+  const { title, body } = copy[rejection.kind];
+  return htmlResponse(errorPage(title, body), rejection.status, s);
+}
+
+/** The same rejection as a JSON body, for the save path. */
+function rejectionJson(rejection: LinkRejection, s: Strings): Response {
+  const copy: Record<RejectionKind, string> = {
+    notFound: s.errNotFoundBody,
+    revoked: s.errRevokedBody,
+    expired: s.errExpiredBody,
+  };
+  return jsonResponse({ error: copy[rejection.kind] }, rejection.status);
+}
 
 /**
  * Resolve a share token to a live link. Both the page render and the save
@@ -138,30 +170,13 @@ async function resolveLink(
     .maybeSingle();
   if (error) throw error;
   if (!data) {
-    return {
-      link: null,
-      rejection: { title: "Nicht gefunden", message: "Dieser Link ist ungültig.", status: 404 },
-    };
+    return { link: null, rejection: { kind: "notFound", status: 404 } };
   }
   if (data.revoked_at) {
-    return {
-      link: null,
-      rejection: {
-        title: "Zurückgezogen",
-        message: "Dieser Freigabelink wurde zurückgezogen.",
-        status: 410,
-      },
-    };
+    return { link: null, rejection: { kind: "revoked", status: 410 } };
   }
   if (data.expires_at && new Date(data.expires_at as string).getTime() <= Date.now()) {
-    return {
-      link: null,
-      rejection: {
-        title: "Abgelaufen",
-        message: "Dieser Freigabelink ist abgelaufen. Bitte frage nach einem neuen.",
-        status: 410,
-      },
-    };
+    return { link: null, rejection: { kind: "expired", status: 410 } };
   }
   return {
     link: {
@@ -186,38 +201,38 @@ Deno.serve(async (req) => {
   }
   const clientIp = req.headers.get("x-forwarded-for")?.split(",")[0].trim() ||
     req.headers.get("x-real-ip") || "unknown";
+  // The guest's language, off their own browser. Every response below — page,
+  // error page, JSON — is built with it.
+  const s = stringsFor(negotiateLocale(req.headers.get("Accept-Language")));
 
   if (req.method === "POST") {
-    return await handleSave(req, clientIp);
+    return await handleSave(req, clientIp, s);
   }
   if (req.method !== "GET" && req.method !== "HEAD") {
-    return htmlResponse(errorPage("Nicht erlaubt", "Diese Seite wird nur per Aufruf im Browser angezeigt."), 405);
+    return htmlResponse(errorPage(s.errMethodTitle, s.errMethodBody), 405, s);
   }
 
   if (rateLimited(readBuckets, clientIp, READ_RATE_LIMIT_MAX)) {
-    return htmlResponse(
-      errorPage("Zu viele Anfragen", "Bitte versuche es in einer Minute erneut."),
-      429,
-    );
+    return htmlResponse(errorPage(s.errRateTitle, s.errRateBody), 429, s);
   }
 
   try {
     const url = Deno.env.get("SUPABASE_URL") ?? "";
     const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
     if (!url || !serviceRoleKey) {
-      return htmlResponse(errorPage("Nicht verfügbar", "Der Server ist nicht korrekt konfiguriert."), 500);
+      return htmlResponse(errorPage(s.errUnavailableTitle, s.errUnavailableBody), 500, s);
     }
 
     const token = new URL(req.url).searchParams.get("token")?.trim() ?? "";
     if (!token) {
-      return htmlResponse(errorPage("Link unvollständig", "Dieser Link enthält kein Token."), 400);
+      return htmlResponse(errorPage(s.errNoTokenTitle, s.errNoTokenBody), 400, s);
     }
 
     const admin = createPackalongAdmin(url, serviceRoleKey);
 
     const { link, rejection } = await resolveLink(admin, token);
     if (!link) {
-      return htmlResponse(errorPage(rejection!.title, rejection!.message), rejection!.status);
+      return rejectionPage(rejection!, s);
     }
 
     const [tripRes, guestRes] = await Promise.all([
@@ -237,7 +252,7 @@ Deno.serve(async (req) => {
     const trip = tripRes.data;
     const guest = guestRes.data;
     if (!trip || trip.deleted || !guest || guest.deleted) {
-      return htmlResponse(errorPage("Nicht mehr verfügbar", "Diese Reise oder dieser Gast existiert nicht mehr."), 404);
+      return htmlResponse(errorPage(s.errGoneTitle, s.errGoneBody), 404, s);
     }
 
     const items = await loadGuestItems(admin, link);
@@ -284,13 +299,11 @@ Deno.serve(async (req) => {
       joinToken,
       token,
       editable: withinEditWindow(trip.end_date as string | null),
+      s,
     });
-    return htmlResponse(page, 200);
+    return htmlResponse(page, 200, s);
   } catch (_error) {
-    return htmlResponse(
-      errorPage("Etwas ist schiefgelaufen", "Diese Seite konnte gerade nicht geladen werden. Bitte versuche es später erneut."),
-      500,
-    );
+    return htmlResponse(errorPage(s.errGenericTitle, s.errGenericBody), 500, s);
   }
 });
 
@@ -324,38 +337,38 @@ async function loadGuestItems(
  * stay untouched, and the items_set_updated_at trigger carries the change to
  * the circle over realtime.
  */
-async function handleSave(req: Request, clientIp: string): Promise<Response> {
+async function handleSave(req: Request, clientIp: string, s: Strings): Promise<Response> {
   if (rateLimited(writeBuckets, clientIp, WRITE_RATE_LIMIT_MAX)) {
-    return jsonResponse({ error: "Zu viele Anfragen. Bitte kurz warten." }, 429);
+    return jsonResponse({ error: s.saveRateLimited }, 429);
   }
 
   try {
     const url = Deno.env.get("SUPABASE_URL") ?? "";
     const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
     if (!url || !serviceRoleKey) {
-      return jsonResponse({ error: "Der Server ist nicht korrekt konfiguriert." }, 500);
+      return jsonResponse({ error: s.saveNotConfigured }, 500);
     }
 
     let body: { token?: unknown; changes?: unknown };
     try {
       body = await req.json();
     } catch {
-      return jsonResponse({ error: "Ungültige Anfrage." }, 400);
+      return jsonResponse({ error: s.saveBadRequest }, 400);
     }
 
     const token = typeof body.token === "string" ? body.token.trim() : "";
     if (!token) {
-      return jsonResponse({ error: "Dieser Link enthält kein Token." }, 400);
+      return jsonResponse({ error: s.saveNoToken }, 400);
     }
 
     if (!Array.isArray(body.changes)) {
-      return jsonResponse({ error: "Ungültige Anfrage." }, 400);
+      return jsonResponse({ error: s.saveBadRequest }, 400);
     }
     if (body.changes.length === 0) {
       return jsonResponse({ saved: 0 }, 200);
     }
     if (body.changes.length > MAX_CHANGES_PER_SAVE) {
-      return jsonResponse({ error: "Zu viele Änderungen auf einmal." }, 400);
+      return jsonResponse({ error: s.saveTooMany }, 400);
     }
 
     // Each change names its direction by which field it carries. Requiring
@@ -364,24 +377,24 @@ async function handleSave(req: Request, clientIp: string): Promise<Response> {
     for (const raw of body.changes) {
       const change = raw as { id?: unknown; status?: unknown; returnPacked?: unknown };
       if (typeof change.id !== "string") {
-        return jsonResponse({ error: "Ungültige Anfrage." }, 400);
+        return jsonResponse({ error: s.saveBadRequest }, 400);
       }
       const hasStatus = change.status !== undefined;
       const hasReturn = change.returnPacked !== undefined;
       if (hasStatus === hasReturn) {
-        return jsonResponse({ error: "Ungültige Anfrage." }, 400);
+        return jsonResponse({ error: s.saveBadRequest }, 400);
       }
       if (hasStatus) {
         if (typeof change.status !== "string") {
-          return jsonResponse({ error: "Ungültige Anfrage." }, 400);
+          return jsonResponse({ error: s.saveBadRequest }, 400);
         }
         if (!GUEST_SETTABLE_STATUSES.has(change.status)) {
-          return jsonResponse({ error: "Unbekannter Status." }, 400);
+          return jsonResponse({ error: s.saveUnknownStatus }, 400);
         }
         changes.push({ id: change.id, kind: "status", status: change.status });
       } else {
         if (typeof change.returnPacked !== "boolean") {
-          return jsonResponse({ error: "Ungültige Anfrage." }, 400);
+          return jsonResponse({ error: s.saveBadRequest }, 400);
         }
         changes.push({ id: change.id, kind: "return", returnPacked: change.returnPacked });
       }
@@ -391,7 +404,7 @@ async function handleSave(req: Request, clientIp: string): Promise<Response> {
 
     const { link, rejection } = await resolveLink(admin, token);
     if (!link) {
-      return jsonResponse({ error: rejection!.message }, rejection!.status);
+      return rejectionJson(rejection!, s);
     }
 
     const { data: trip, error: tripError } = await admin
@@ -401,14 +414,11 @@ async function handleSave(req: Request, clientIp: string): Promise<Response> {
       .maybeSingle();
     if (tripError) throw tripError;
     if (!trip || trip.deleted) {
-      return jsonResponse({ error: "Diese Reise existiert nicht mehr." }, 404);
+      return jsonResponse({ error: s.saveTripGone }, 404);
     }
     // The page may have sat open since before the trip ended.
     if (!withinEditWindow(trip.end_date as string | null)) {
-      return jsonResponse(
-        { error: "Die Reise ist vorbei — die Liste kann nicht mehr geändert werden." },
-        409,
-      );
+      return jsonResponse({ error: s.saveWindowClosed }, 409);
     }
 
     // The authoritative scope: exactly the rows the page would render right
@@ -445,7 +455,7 @@ async function handleSave(req: Request, clientIp: string): Promise<Response> {
     return jsonResponse({ saved, requested: changes.length }, 200);
   } catch (_error) {
     return jsonResponse(
-      { error: "Das Speichern hat gerade nicht geklappt. Bitte später erneut versuchen." },
+      { error: s.saveFailed },
       500,
     );
   }
@@ -453,28 +463,20 @@ async function handleSave(req: Request, clientIp: string): Promise<Response> {
 
 // rendering ---------------------------------------------------------------
 
-const STATUS_META: Record<string, { emoji: string; label: string }> = {
-  packed: { emoji: "✅", label: "Gepackt" },
-  toBuy: { emoji: "🛒", label: "Zu kaufen" },
-  open: { emoji: "⬜", label: "Offen" },
-  unclear: { emoji: "❓", label: "Unklar" },
-  planning: { emoji: "🗓️", label: "Planung" },
+// Emoji only — the labels come from the guest's Strings, since an emoji is the
+// same in every language and a word is not.
+const STATUS_EMOJI: Record<StatusKey, string> = {
+  packed: "✅",
+  toBuy: "🛒",
+  open: "⬜",
+  unclear: "❓",
+  planning: "🗓️",
 };
-
-const NO_CONTAINER = "Ohne Behälter";
-const NO_CATEGORY = "Sonstiges";
+const DIRECTION_EMOJI = { outbound: "🧳", return: "↩️" };
 
 // Order the guest picks from. Mirrors GUEST_SETTABLE_STATUSES, but ordered
 // for the dropdown: the two everyday answers first.
-const STATUS_CHOICES = ["open", "packed", "toBuy", "unclear", "planning"];
-
-// Tab wording follows the app's segmented switch (l10n packDirectionOutbound /
-// packDirectionReturn / packDirectionReturnBanner) so a guest who later
-// installs PackAlong meets the same two words.
-const DIRECTION_META = {
-  outbound: { emoji: "🧳", label: "Hinpacken" },
-  return: { emoji: "↩️", label: "Rückpacken" },
-};
+const STATUS_CHOICES: StatusKey[] = ["open", "packed", "toBuy", "unclear", "planning"];
 
 function renderPage({
   trip,
@@ -484,6 +486,7 @@ function renderPage({
   joinToken,
   token,
   editable,
+  s,
 }: {
   trip: Record<string, unknown>;
   guest: Record<string, unknown>;
@@ -492,11 +495,17 @@ function renderPage({
   joinToken: string | null;
   token: string;
   editable: boolean;
+  s: Strings;
 }): string {
   const tripEmoji = (trip.emoji as string | null) || (trip.template_emoji as string | null) || "🧳";
-  const tripTitle = esc((trip.title as string | null) ?? "Reise");
-  const dateRange = formatDateRange(trip.start_date as string | null, trip.end_date as string | null);
-  const guestName = esc((guest.name as string | null) ?? "Gast");
+  const tripTitle = esc((trip.title as string | null) ?? s.tripFallbackTitle);
+  const dateRange = formatDateRange(
+    trip.start_date as string | null,
+    trip.end_date as string | null,
+    s,
+  );
+  const guestNameRaw = (guest.name as string | null) ?? s.guestFallbackName;
+  const guestName = esc(guestNameRaw);
   const guestEmoji = (guest.avatar_emoji as string | null) || "🙂";
 
   const packedOut = items.filter((i) => i.status === "packed").length;
@@ -509,12 +518,14 @@ function renderPage({
   // once there is a list to switch between.
   const showTabs = total > 0;
 
-  const groups = groupItems(items, containersById);
+  const groups = groupItems(items, containersById, s);
   const listHtml = total === 0
-    ? `<p class="empty">Für ${guestName} sind auf dieser Reise noch keine Sachen eingetragen.</p>`
-    : groups.map((group) => renderContainerGroup(group, canEdit)).join("");
+    ? `<p class="empty">${esc(s.emptyList(guestNameRaw))}</p>`
+    : groups.map((group) => renderContainerGroup(group, canEdit, s)).join("");
 
-  const joinHtml = renderJoinBlock(guest.email as string | null, joinToken);
+  const joinHtml = renderJoinBlock(guest.email as string | null, joinToken, s);
+  const reportLink =
+    `<a href="mailto:report@packalong.org?subject=Report%20guest%20view">${esc(s.reportLinkLabel)}</a>`;
 
   return `<main class="dir-outbound${canEdit ? " editable" : ""}">
   <header class="hero">
@@ -523,36 +534,32 @@ function renderPage({
     ${dateRange ? `<p class="dates">${esc(dateRange)}</p>` : ""}
     <div class="guest">
       <span class="guest-emoji">${esc(guestEmoji)}</span>
-      <span>Packliste für <strong>${guestName}</strong></span>
+      <span>${s.packListForHtml(guestName)}</span>
     </div>
     ${
     total > 0
-      ? `<p class="progress only-outbound">${packedOut} von ${total} gepackt</p>
-    <p class="progress only-return">${packedReturn} von ${total} wieder eingepackt</p>`
+      ? `<p class="progress only-outbound">${esc(s.progressOutbound(packedOut, total))}</p>
+    <p class="progress only-return">${esc(s.progressReturn(packedReturn, total))}</p>`
       : ""
   }
-    ${renderDirectionHint(canEdit, total)}
+    ${renderDirectionHint(canEdit, total, s)}
   </header>
 
-  ${showTabs ? renderTabs() : ""}
+  ${showTabs ? renderTabs(s) : ""}
 
   <section class="list">
     ${listHtml}
   </section>
 
-  ${canEdit ? renderSaveBar() : ""}
+  ${canEdit ? renderSaveBar(s) : ""}
 
   ${joinHtml}
 
   <footer>
-    <p class="report">
-      Missbrauch oder unangemessene Inhalte?
-      <a href="mailto:report@packalong.org?subject=Report%20guest%20view">Melden</a>.
-      Nutzung unterliegt der EULA; gemeldete Inhalte werden geprüft.
-    </p>
+    <p class="report">${s.reportHtml(reportLink)}</p>
     <p class="brand">PackAlong</p>
   </footer>
-  ${showTabs ? `<script>${pageScript(canEdit ? token : null)}</script>` : ""}
+  ${showTabs ? `<script>${pageScript(canEdit ? token : null, s)}</script>` : ""}
 </main>`;
 }
 
@@ -565,13 +572,14 @@ type ContainerGroup = {
 function groupItems(
   items: ItemRow[],
   containersById: Map<string, { name: string; icon: string | null }>,
+  s: Strings,
 ): ContainerGroup[] {
   const byContainer = new Map<string, ContainerGroup>();
   // Stable key that keeps "no container" last.
   for (const item of items) {
     const container = item.container_id ? containersById.get(item.container_id) : null;
     const containerKey = item.container_id ?? "__none__";
-    const containerName = container?.name ?? NO_CONTAINER;
+    const containerName = container?.name ?? s.noContainer;
     let group = byContainer.get(containerKey);
     if (!group) {
       group = { name: containerName, icon: container?.icon ?? null, categories: [] };
@@ -579,7 +587,7 @@ function groupItems(
     }
     const categoryName = (item.category && item.category.trim().length > 0)
       ? item.category.trim()
-      : NO_CATEGORY;
+      : s.noCategory;
     let category = group.categories.find((c) => c.name === categoryName);
     if (!category) {
       category = { name: categoryName, items: [] };
@@ -589,17 +597,21 @@ function groupItems(
   }
 
   const groups = [...byContainer.values()];
+  // Container and item names are user data in whatever language the circle
+  // types in, but the guest's locale decides the collation — that is whose
+  // alphabet the reading eye expects.
+  const collator = s.intlLocale;
   // Order: named containers alphabetically, "no container" last.
   groups.sort((a, b) => {
-    if (a.name === NO_CONTAINER) return 1;
-    if (b.name === NO_CONTAINER) return -1;
-    return a.name.localeCompare(b.name, "de");
+    if (a.name === s.noContainer) return 1;
+    if (b.name === s.noContainer) return -1;
+    return a.name.localeCompare(b.name, collator);
   });
   for (const group of groups) {
-    group.categories.sort((a, b) => a.name.localeCompare(b.name, "de"));
+    group.categories.sort((a, b) => a.name.localeCompare(b.name, collator));
     for (const category of group.categories) {
       category.items.sort((a, b) =>
-        (a.sort_order - b.sort_order) || a.title.localeCompare(b.title, "de")
+        (a.sort_order - b.sort_order) || a.title.localeCompare(b.title, collator)
       );
     }
   }
@@ -607,37 +619,37 @@ function groupItems(
 }
 
 /**
- * The line under the header. It differs per direction — "Rückpacken" needs the
- * app's framing ("was für die Heimreise wieder eingepackt wurde") or a guest
- * reads the tab as a second, unfamiliar list rather than the same things on
+ * The line under the header. It differs per direction — the return tab needs
+ * the app's framing ("was für die Heimreise wieder eingepackt wurde") or a
+ * guest reads it as a second, unfamiliar list rather than the same things on
  * the way home.
  */
-function renderDirectionHint(canEdit: boolean, total: number): string {
+function renderDirectionHint(canEdit: boolean, total: number, s: Strings): string {
   if (total === 0) return "";
   if (!canEdit) {
-    return `<p class="hint only-outbound">Diese Ansicht ist nur zum Anschauen.</p>
-    <p class="hint only-return">Was für die Heimreise wieder eingepackt wurde. Nur zum Anschauen.</p>`;
+    return `<p class="hint only-outbound">${esc(s.hintReadOnlyOutbound)}</p>
+    <p class="hint only-return">${esc(s.hintReadOnlyReturn)}</p>`;
   }
-  return `<p class="hint only-outbound">Du kannst den Status deiner Sachen ändern. Zum Übernehmen unten speichern.</p>
-    <p class="hint only-return">Hier hakst du ab, was für die Heimreise wieder eingepackt ist. Zum Übernehmen unten speichern.</p>`;
+  return `<p class="hint only-outbound">${esc(s.hintEditOutbound)}</p>
+    <p class="hint only-return">${esc(s.hintEditReturn)}</p>`;
 }
 
-function renderTabs(): string {
-  const tab = (dir: keyof typeof DIRECTION_META, active: boolean) => {
-    const meta = DIRECTION_META[dir];
-    return `<button type="button" class="tab${active ? " active" : ""}" role="tab"
-      aria-selected="${active}" data-dir="${dir}">${esc(meta.emoji)} ${esc(meta.label)}</button>`;
-  };
-  return `<div class="tabs" role="tablist" aria-label="Packrichtung">
-    ${tab("outbound", true)}${tab("return", false)}
+function renderTabs(s: Strings): string {
+  const tab = (dir: "outbound" | "return", label: string, active: boolean) =>
+    `<button type="button" class="tab${active ? " active" : ""}" role="tab"
+      aria-selected="${active}" data-dir="${dir}">${esc(DIRECTION_EMOJI[dir])} ${
+      esc(label)
+    }</button>`;
+  return `<div class="tabs" role="tablist" aria-label="${esc(s.tabsAriaLabel)}">
+    ${tab("outbound", s.dirOutbound, true)}${tab("return", s.dirReturn, false)}
   </div>`;
 }
 
-function renderContainerGroup(group: ContainerGroup, canEdit: boolean): string {
+function renderContainerGroup(group: ContainerGroup, canEdit: boolean, s: Strings): string {
   const heading = `${group.icon ? esc(group.icon) + " " : ""}${esc(group.name)}`;
   const categories = group.categories.map((category) => {
-    const rows = category.items.map((item) => renderItem(item, canEdit)).join("");
-    const showCategory = category.name !== NO_CATEGORY || group.categories.length > 1;
+    const rows = category.items.map((item) => renderItem(item, canEdit, s)).join("");
+    const showCategory = category.name !== s.noCategory || group.categories.length > 1;
     return `${showCategory ? `<h3 class="category">${esc(category.name)}</h3>` : ""}
       <ul>${rows}</ul>`;
   }).join("");
@@ -653,8 +665,8 @@ function renderContainerGroup(group: ContainerGroup, canEdit: boolean): string {
  * control beats two parallel lists: the grouping, the ids and the staged-edit
  * bookkeeping all stay single-copy, and switching tabs costs no DOM rebuild.
  */
-function renderItem(item: ItemRow, canEdit: boolean): string {
-  const meta = STATUS_META[item.status] ?? STATUS_META.open;
+function renderItem(item: ItemRow, canEdit: boolean, s: Strings): string {
+  const statusKey = (item.status in STATUS_EMOJI ? item.status : "open") as StatusKey;
   const qty = item.quantity && item.quantity > 1 ? ` <span class="qty">×${item.quantity}</span>` : "";
   const note = item.note && item.note.trim().length > 0
     ? `<span class="note">${esc(item.note.trim())}</span>`
@@ -667,41 +679,43 @@ function renderItem(item: ItemRow, canEdit: boolean): string {
   const title = `<span class="title">${esc(item.title)}${qty}${note}</span>`;
 
   if (!canEdit) {
-    const returnMeta = item.return_packed
-      ? { emoji: "✅", label: "Wieder eingepackt" }
-      : { emoji: "⬜", label: "Noch nicht wieder eingepackt" };
+    const returnEmoji = item.return_packed ? "✅" : "⬜";
+    const returnLabel = item.return_packed ? s.returnPackedYes : s.returnPackedNo;
     return `<li class="item${packedClasses}">
-    <span class="status only-outbound" title="${esc(meta.label)}">${esc(meta.emoji)}</span>
-    <span class="status only-return" title="${esc(returnMeta.label)}">${esc(returnMeta.emoji)}</span>
+    <span class="status only-outbound" title="${esc(s.statuses[statusKey])}">${
+      esc(STATUS_EMOJI[statusKey])
+    }</span>
+    <span class="status only-return" title="${esc(returnLabel)}">${esc(returnEmoji)}</span>
     ${title}
   </li>`;
   }
 
   // data-initial-* lets the script send only what actually changed, and lets a
   // guest undo their way back to a clean state.
-  const options = STATUS_CHOICES.map((value) => {
-    const optionMeta = STATUS_META[value];
-    return `<option value="${esc(value)}"${value === item.status ? " selected" : ""}>${
-      esc(`${optionMeta.emoji} ${optionMeta.label}`)
-    }</option>`;
-  }).join("");
+  const options = STATUS_CHOICES.map((value) =>
+    `<option value="${esc(value)}"${value === item.status ? " selected" : ""}>${
+      esc(`${STATUS_EMOJI[value]} ${s.statuses[value]}`)
+    }</option>`
+  ).join("");
   return `<li class="item${packedClasses}" data-item="${esc(item.id)}"
     data-initial-status="${esc(item.status)}" data-initial-return="${item.return_packed}">
     ${title}
-    <select class="status-select only-outbound" aria-label="${esc(`Status von ${item.title}`)}">${options}</select>
+    <select class="status-select only-outbound" aria-label="${
+    esc(s.statusAria(item.title))
+  }">${options}</select>
     <label class="return-toggle only-return">
       <input type="checkbox" class="return-check"${item.return_packed ? " checked" : ""}
-        aria-label="${esc(`${item.title} für die Heimreise eingepackt`)}">
-      <span>Eingepackt</span>
+        aria-label="${esc(s.returnAria(item.title))}">
+      <span>${esc(s.returnToggleLabel)}</span>
     </label>
   </li>`;
 }
 
-function renderSaveBar(): string {
+function renderSaveBar(s: Strings): string {
   return `<div class="savebar" hidden>
     <div class="savebar-inner">
       <span class="savebar-text" role="status"></span>
-      <button type="button" class="btn primary save-btn">Speichern</button>
+      <button type="button" class="btn primary save-btn">${esc(s.saveButton)}</button>
     </div>
   </div>`;
 }
@@ -717,14 +731,21 @@ function renderSaveBar(): string {
  * server truth rather than the browser's optimistic guess; that also surfaces
  * any item the save skipped because it left the guest's scope meanwhile.
  */
-function pageScript(token: string | null): string {
-  // Escaping "<" keeps a token from ever closing the <script> element early.
-  // Tokens are generator-minted and can't contain one, but the page is the
-  // wrong place to rely on that.
-  const literal = token === null ? "null" : JSON.stringify(token).replaceAll("<", "\\u003C");
+function pageScript(token: string | null, s: Strings): string {
+  // Escaping "<" keeps a value from ever closing the <script> element early.
+  // Tokens are generator-minted and the strings are ours, but the page is the
+  // wrong place to rely on either.
+  const literal = (value: unknown) => JSON.stringify(value).replaceAll("<", "\\u003C");
+  const copy = literal({
+    one: s.changeCountOne,
+    other: s.changeCountOther,
+    saving: s.saveInProgress,
+    failed: s.saveGenericFail,
+  });
   return `
 (function () {
-  var token = ${literal};
+  var token = ${token === null ? "null" : literal(token)};
+  var copy = ${copy};
   var main = document.querySelector("main");
   var tabs = Array.prototype.slice.call(document.querySelectorAll(".tab"));
 
@@ -768,7 +789,7 @@ function pageScript(token: string | null): string {
   function refresh() {
     var count = pending().length;
     bar.hidden = count === 0;
-    text.textContent = count === 1 ? "1 Änderung" : count + " Änderungen";
+    text.textContent = count === 1 ? copy.one : copy.other.replace("{n}", count);
   }
 
   items.forEach(function (li) {
@@ -789,7 +810,7 @@ function pageScript(token: string | null): string {
     if (changes.length === 0) return;
     button.disabled = true;
     bar.classList.remove("error");
-    text.textContent = "Wird gespeichert …";
+    text.textContent = copy.saving;
     fetch(window.location.pathname + window.location.search, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -802,7 +823,7 @@ function pageScript(token: string | null): string {
     }).catch(function (err) {
       button.disabled = false;
       bar.classList.add("error");
-      text.textContent = (err && err.message) || "Speichern fehlgeschlagen.";
+      text.textContent = (err && err.message) || copy.failed;
     });
   });
 
@@ -816,20 +837,23 @@ function pageScript(token: string | null): string {
 `;
 }
 
-function renderJoinBlock(email: string | null, joinToken: string | null): string {
+function renderJoinBlock(email: string | null, joinToken: string | null, s: Strings): string {
   const appHost = Deno.env.get("PUBLIC_APP_HOST") ?? "packalong.org";
   const downloadUrl = `https://${appHost}`;
   if (joinToken && email) {
     const joinUrl = `https://${appHost}/claim/${encodeURIComponent(joinToken)}`;
+    // The masked address is bolded inside the sentence, so the hint is
+    // assembled from an escaped fragment rather than escaped as a whole.
+    const emailHtml = `<strong>${esc(maskEmail(email))}</strong>`;
     return `<section class="cta">
-      <a class="btn primary" href="${esc(joinUrl)}">App holen &amp; beitreten</a>
-      <p class="hint">Zum Beitreten mit <strong>${esc(maskEmail(email))}</strong> registrieren oder anmelden.</p>
-      <p class="fallback"><a href="${esc(downloadUrl)}">App noch nicht installiert? Hier laden.</a></p>
+      <a class="btn primary" href="${esc(joinUrl)}">${esc(s.joinCta)}</a>
+      <p class="hint">${s.joinHintHtml(emailHtml)}</p>
+      <p class="fallback"><a href="${esc(downloadUrl)}">${esc(s.joinFallback)}</a></p>
     </section>`;
   }
   return `<section class="cta">
-    <a class="btn" href="${esc(downloadUrl)}">App laden</a>
-    <p class="hint">Diese Ansicht ist nur zum Anschauen. Für einen eigenen Zugang bitte die App laden.</p>
+    <a class="btn" href="${esc(downloadUrl)}">${esc(s.downloadCta)}</a>
+    <p class="hint">${esc(s.viewOnlyCta)}</p>
   </section>`;
 }
 
@@ -842,15 +866,15 @@ function maskEmail(email: string): string {
   return `${shown}${"•".repeat(Math.max(2, Math.min(local.length - 1, 3)))}@${domain}`;
 }
 
-function formatDateRange(start: string | null, end: string | null): string {
+function formatDateRange(start: string | null, end: string | null, s: Strings): string {
   const fmt = (iso: string) =>
-    new Intl.DateTimeFormat("de-DE", { day: "2-digit", month: "2-digit", year: "numeric" })
+    new Intl.DateTimeFormat(s.intlLocale, { day: "2-digit", month: "2-digit", year: "numeric" })
       .format(new Date(iso));
   if (start && end) {
     return start === end ? fmt(start) : `${fmt(start)} – ${fmt(end)}`;
   }
-  if (start) return `ab ${fmt(start)}`;
-  if (end) return `bis ${fmt(end)}`;
+  if (start) return s.dateFrom(fmt(start));
+  if (end) return s.dateUntil(fmt(end));
   return "";
 }
 
@@ -865,8 +889,8 @@ function esc(value: string): string {
     .replaceAll("'", "&#39;");
 }
 
-function htmlResponse(body: string, status: number): Response {
-  return new Response(document(body), {
+function htmlResponse(body: string, status: number, s: Strings): Response {
+  return new Response(document(body, s), {
     status,
     headers: {
       "Content-Type": "text/html; charset=utf-8",
@@ -896,14 +920,14 @@ function errorPage(title: string, message: string): string {
   </main>`;
 }
 
-function document(inner: string): string {
+function document(inner: string, s: Strings): string {
   return `<!doctype html>
-<html lang="de">
+<html lang="${esc(s.htmlLang)}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
-<title>PackAlong – Gastansicht</title>
+<title>${esc(s.pageTitle)}</title>
 <style>
 :root {
   --bg: #f5f5f7; --card: #ffffff; --fg: #1c1c1e; --muted: #6b6b70;
